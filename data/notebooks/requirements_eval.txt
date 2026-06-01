@@ -1,0 +1,6 @@
+# RAG Medical Chatbot — Evaluation Framework
+# Install with: pip install -r requirements_eval.txt
+
+numpy>=1.24
+requests>=2.31
+cohere>=4.0           # your existing LLM provider

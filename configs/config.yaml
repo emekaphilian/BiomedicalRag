@@ -1,0 +1,49 @@
+# Biomedical RAG System Configuration
+
+environment: development
+debug: true
+
+embeddings:
+  provider: "sentence-transformers"
+  model_name: "all-MiniLM-L6-v2"
+  dimension: 384
+  batch_size: 32
+
+vectorstore:
+  type: "faiss"
+  index_path: "data/index/vectorstore"
+  persist: true
+
+retriever:
+  top_k: 5
+  similarity_threshold: 0.3
+
+reranker:
+  enabled: true
+  model_name: "cross-encoder/ms-marco-MiniLM-L-12-v2"
+  top_k: 5
+
+generator:
+  provider: "openai"
+  model_name: "gpt-3.5-turbo"
+  max_tokens: 256
+  temperature: 0.3
+  top_p: 0.9
+
+safety:
+  medical_disclaimer_enabled: true
+  hallucination_detection: true
+  medical_content_filtering: true
+  rate_limiting_enabled: true
+  max_requests_per_minute: 60
+
+data:
+  raw_path: "data/raw"
+  processed_path: "data/processed"
+  index_path: "data/index"
+  chunk_size: 512
+  chunk_overlap: 50
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

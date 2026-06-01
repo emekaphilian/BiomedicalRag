@@ -1,12 +1,71 @@
-.venv/
+# Virtual environments
+venv/
 venv311/
+.venv/
+ENV/
+env/
+
+# Python
 __pycache__/
-.env
 *.pyc
 *.pyo
 *.pyd
-*.db
-node_modules/
-vectorstore_index/
+*.so
+*.egg
+*.egg-info/
 dist/
-build/  
+build/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Models and indexes
+faiss_index/
+faiss_indices/
+models/
+checkpoints/
+*.faiss
+*.pkl
+*.npy
+vectorstore_index/
+
+# Temporary files
+*.tmp
+*.temp
+.tmp/
+
+# Data files (large) - CRITICAL
+data/raw/
+data/processed/
+data/index/
+data/*.jsonl
+data/**/*.json
+data/**/*.zip
+
+# Results and outputs (large)
+results/
+output/
+*.json
+*.jsonl
+*.csv
+
+# IDE
+*.swp
+*.swo
+*~
