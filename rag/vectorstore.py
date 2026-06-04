@@ -10,9 +10,17 @@ class BiomedicalVectorStore:
 
     def __init__(self):
 
-        self.model = SentenceTransformer("all-MiniLM-L6-v2")
-
-        self.dimension = 384
+        # Use BioLORD-2023 as per proposal (768-dimensional biomedical embeddings)
+        # Falls back to all-MiniLM-L6-v2 (384 dims) if BioLORD unavailable
+        try:
+            self.model = SentenceTransformer("BioLORD-2023")
+            self.dimension = 768
+            self.model_name = "BioLORD-2023"
+        except Exception:
+            print("WARNING: BioLORD-2023 not available, falling back to all-MiniLM-L6-v2")
+            self.model = SentenceTransformer("all-MiniLM-L6-v2")
+            self.dimension = 384
+            self.model_name = "all-MiniLM-L6-v2"
 
         self.index = faiss.IndexFlatL2(self.dimension)
 
