@@ -22,6 +22,11 @@ class RerankingRetriever:
             reranker_model: Cross-encoder model name (optional)
         """
         self.hybrid_retriever = HybridRetriever(vectorstore, documents)
+        self.document_metadata = {}
+        retrieval_documents = list(documents)
+        retrieval_documents.extend(getattr(vectorstore, "documents", []))
+        for document in retrieval_documents:
+            self.document_metadata.setdefault(document.content, document.metadata)
         
         if reranker_model:
             self.reranker = CrossEncoderReranker(reranker_model)
@@ -50,8 +55,9 @@ class RerankingRetriever:
         fused_results = hybrid_response["fused_results"]
         
         candidates = [
-            (content, {"source": "MedQuAD"}, score)
+            (content, self.document_metadata[content], score)
             for content, score in fused_results
+            if content in self.document_metadata
         ]
 
         # Step 3: Rerank with cross-encoder

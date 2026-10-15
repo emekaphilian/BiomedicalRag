@@ -1,79 +1,43 @@
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import pytest
 
-from rag.document import BiomedicalDocument
-from rag.chunking import chunk_document
-from rag.vectorstore import BiomedicalVectorStore
-from rag.retriever import BiomedicalRetriever
-from rag.grounding import build_grounded_context
+from rag.document import RetrievedChunk
+from rag.grounding import MIN_GROUNDING_SCORE, build_grounded_context, is_grounded
 
 
-print("\n=== BLOCK 3 RETRIEVAL GROUNDING TEST ===\n")
+def chunk(content="Evidence text", source="MedlinePlus", distance=0.5):
+    return RetrievedChunk(
+        content=content,
+        metadata={"source": source},
+        similarity_score=distance,
+    )
 
 
-doc1 = BiomedicalDocument(
-    content="""
-Diabetes mellitus is a chronic metabolic disease characterized
-by elevated blood glucose levels. Common symptoms include
-frequent urination, excessive thirst, and unexplained weight loss.
-""",
-    metadata={
-        "source": "WHO Diabetes Guidelines"
-    }
-)
+def test_is_grounded_accepts_distance_below_threshold():
+    assert is_grounded([chunk(distance=MIN_GROUNDING_SCORE - 0.01)])
 
 
-doc2 = BiomedicalDocument(
-    content="""
-Hypertension is defined as persistently elevated blood pressure.
-Lifestyle modification and antihypertensive medications are commonly used.
-""",
-    metadata={
-        "source": "CDC Hypertension Guide"
-    }
-)
+def test_is_grounded_rejects_distance_at_threshold():
+    assert not is_grounded([chunk(distance=MIN_GROUNDING_SCORE)])
 
 
-all_chunks = []
-
-for doc in [doc1, doc2]:
-
-    chunks = chunk_document(doc)
-
-    all_chunks.extend(chunks)
+@pytest.mark.parametrize("distance", [-0.1, float("nan"), float("inf")])
+def test_is_grounded_rejects_invalid_distance(distance):
+    assert not is_grounded([chunk(distance=distance)])
 
 
-print(f"Created chunks: {len(all_chunks)}")
+def test_is_grounded_rejects_empty_results():
+    assert not is_grounded([])
 
 
-vectorstore = BiomedicalVectorStore()
-
-vectorstore.add_documents(all_chunks)
-
-print("Vectorstore indexed successfully")
-
-
-retriever = BiomedicalRetriever(vectorstore)
-
-query = "What are symptoms of diabetes?"
-
-response = retriever.retrieve(query)
-
-print(f"\nGrounded: {response['grounded']}")
-print("\nRetrieved Results:\n")
-
-for idx, result in enumerate(response["results"], start=1):
-
-    print(f"Result {idx}")
-    print(f"Source: {result.metadata['source']}")
-    print(f"Score: {result.similarity_score:.4f}")
-    print(f"Content: {result.content[:120]}...")
-    print("-" * 50)
-
-
-context = build_grounded_context(response["results"])
-
-print("\n=== GROUNDED CONTEXT ===\n")
-
-print(context[:1500])
+def test_build_grounded_context_includes_source_distance_and_evidence():
+    context = build_grounded_context([
+        chunk(content="Diabetes education", source="MedlinePlus", distance=0.25),
+        chunk(content="Research abstract", source="PubMed", distance=0.75),
+    ])
+    assert "[Evidence 1]" in context
+    assert "Source: MedlinePlus" in context
+    assert "Distance: 0.2500" in context
+    assert "Diabetes education" in context
+    assert "[Evidence 2]" in context
+    assert "Source: PubMed" in context
+    assert "Research abstract" in context

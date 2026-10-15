@@ -59,7 +59,9 @@ class ContextCompressor:
                 "content": content,
                 "rerank_score": result.get("rerank_score", 0)
             }
-            
+            if metadata:
+                evidence_item["metadata"] = metadata
+
             compressed_context.append(evidence_item)
             sources.append(source)
 

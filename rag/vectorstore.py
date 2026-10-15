@@ -35,12 +35,15 @@ class BiomedicalVectorStore:
         self.documents.extend(documents)
 
     def similarity_search(self, query, k=5):
+        """Return the k closest documents using FAISS squared L2 distance."""
+
+        if k <= 0 or not self.documents:
+            return []
 
         query_embedding = self.model.encode([query])
+        query_embedding = np.asarray(query_embedding, dtype=np.float32)
 
-        query_embedding = np.array(query_embedding).astype("float32")
-
-        # Ensure 2D shape
+        # Ensure the query embedding is two-dimensional.
         if query_embedding.ndim == 1:
             query_embedding = query_embedding.reshape(1, -1)
 
@@ -48,14 +51,13 @@ class BiomedicalVectorStore:
 
         results = []
 
-        for score, idx in zip(distances[0], indices[0]):
-
-            # Skip invalid indices (FAISS returns -1 for missing results)
+        for distance, idx in zip(distances[0], indices[0]):
+            # FAISS returns -1 when no valid document exists at a position.
             if idx < 0 or idx >= len(self.documents):
                 continue
 
-            # Skip invalid scores (NaN/inf from uninitialized distances)
-            if not np.isfinite(float(score)):
+            # Skip invalid distances.
+            if not np.isfinite(float(distance)):
                 continue
 
             doc = self.documents[idx]
@@ -63,10 +65,9 @@ class BiomedicalVectorStore:
             results.append(
                 RetrievedChunk(
                     content=doc.content,
-                    metadata=doc.metadata,
-                    similarity_score=float(score)
+                    metadata=dict(doc.metadata),
+                    similarity_score=float(distance),
                 )
             )
 
         return results
-
