@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
-Embeddings Test Script - Run this file to verify everything works
-Usage: python test_embeddings_full.py
+Embeddings verification script - run this file explicitly to check setup.
+Usage: python verify_embeddings.py
 """
 
 import sys

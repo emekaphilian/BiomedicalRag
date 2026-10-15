@@ -1,258 +1,210 @@
-# app/services.py
+"""Dashboard adapter for the repository's grounded biomedical RAG pipeline."""
 
-import os
-from typing import List
-from dotenv import load_dotenv
+from io import BytesIO
+from pathlib import Path
+import re
+from typing import Iterator, List, Optional, Tuple
 
-# -------------------------
-# LOAD ENVIRONMENT VARIABLES
-# -------------------------
-load_dotenv()
-
-HF_TOKEN = os.getenv("HF_API_TOKEN")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-COHERE_KEY = os.getenv("COHERE_API_KEY")
-
-# -------------------------
-# EMBEDDINGS & VECTOR STORE
-# -------------------------
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-INDEX_PATH = "vectorstore_index"
+from rag.document import BiomedicalDocument
+from rag.pipeline import BiomedicalRAGPipeline
 
 
-def get_embeddings():
-    return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+class RAGService:
+    """Expose the upload and query methods expected by the Streamlit UI."""
 
+    def __init__(self, provider: str, model: str, api_key: str):
+        provider = provider.lower()
+        if provider not in {"openai", "cohere", "huggingface"}:
+            raise ValueError(f"Unsupported LLM provider: {provider}")
+        if not api_key or not api_key.strip():
+            raise ValueError("An API key is required to initialize the LLM.")
 
-# -------------------------
-# BASE LLM INTERFACE
-# -------------------------
-class BaseLLM:
-    def invoke(self, prompt: str) -> str:
-        raise NotImplementedError
-
-    def stream(self, prompt: str):
-        """Yield text chunks"""
-        raise NotImplementedError
-
-
-# -------------------------
-# HUGGING FACE LLM
-# -------------------------
-from huggingface_hub import InferenceClient
-
-
-class HFLLM(BaseLLM):
-    def __init__(self, token: str, model_name: str, temperature: float = 0.7, max_tokens: int = 512):
-        if not token:
-            raise ValueError("Hugging Face API token required")
-
-        self.client = InferenceClient(
-            model=model_name,
-            token=token
-        )
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-
-    def invoke(self, prompt: str) -> str:
-        return self.client.text_generation(
-            prompt,
-            max_new_tokens=self.max_tokens,
-            temperature=self.temperature
-        ).strip()
-
-    # ⚠️ HF Inference API does NOT support true streaming
-    def stream(self, prompt: str):
-        # Return the full response as a single chunk since HF doesn't support streaming
-        text = self.invoke(prompt)
-        yield text
-
-
-# -------------------------
-# COHERE LLM (STREAMING ✅)
-# -------------------------
-import cohere
-
-
-class CohereLLM(BaseLLM):
-    def __init__(self, api_key: str, model: str, temperature: float = 0.7, max_tokens: int = 512):
-        self.client = cohere.Client(api_key)
+        self.provider = provider
         self.model = model
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-
-        # Validate
-        self.client.chat(model=self.model, message="hi", max_tokens=1)
-
-    def invoke(self, prompt: str) -> str:
-        response = self.client.chat(
-            model=self.model,
-            message=prompt,
-            max_tokens=self.max_tokens,
-            temperature=self.temperature
+        self._documents: List[BiomedicalDocument] = []
+        self.pipeline = BiomedicalRAGPipeline(
+            {
+                "generator": {
+                    "provider": provider,
+                    "model_name": model,
+                    "api_key": api_key,
+                    "use_mock": False,
+                },
+                "retriever": {"retrieval_k": 20},
+            }
         )
 
-        # Handle different response formats
-        if hasattr(response, "text") and response.text:
-            return response.text.strip()
-        elif hasattr(response, "message") and response.message:
-            if hasattr(response.message, "content") and response.message.content:
-                return response.message.content[0].text.strip() if isinstance(response.message.content, list) else str(response.message.content).strip()
-            return str(response.message).strip()
+    @property
+    def total_chunks(self) -> int:
+        return len(self.pipeline.chunks)
+
+    def ingest(self, file_bytes: bytes, filename: str) -> int:
+        """Extract and index one uploaded PDF, DOCX, or UTF-8 text file."""
+        suffix = Path(filename).suffix.lower()
+        if suffix == ".pdf":
+            from pypdf import PdfReader
+
+            content = "\n".join(
+                page.extract_text() or ""
+                for page in PdfReader(BytesIO(file_bytes)).pages
+            )
+        elif suffix == ".docx":
+            from docx import Document
+
+            document = Document(BytesIO(file_bytes))
+            content = "\n".join(paragraph.text for paragraph in document.paragraphs)
+        elif suffix == ".txt":
+            content = file_bytes.decode("utf-8-sig")
         else:
-            return str(response).strip()
+            raise ValueError("Supported document formats are PDF, DOCX, and TXT.")
 
-    def stream(self, prompt: str):
-        stream = self.client.chat_stream(
-            model=self.model,
-            message=prompt,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens
+        if not content.strip():
+            raise ValueError(f"No readable text was found in {filename}.")
+
+        replacement = BiomedicalDocument(
+            content=content,
+            metadata={"source": filename, "file": filename},
         )
-
-        for event in stream:
-            if event.event_type == "text-generation":
-                yield event.text
-
-
-# -------------------------
-# OPENAI LLM (STREAMING ✅)
-# -------------------------
-from openai import OpenAI
-
-
-class OpenAILLM(BaseLLM):
-    def __init__(self, api_key: str, model: str, temperature: float = 0.7, max_tokens: int = 512):
-        self.client = OpenAI(api_key=api_key)
-        self.model = model
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-
-    def invoke(self, prompt: str) -> str:
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=self.temperature,
-            max_tokens=self.max_tokens
+        existing_index = next(
+            (
+                index for index, document in enumerate(self._documents)
+                if document.metadata.get("source") == filename
+            ),
+            None,
         )
-        return response.choices[0].message.content
+        if existing_index is None:
+            self._documents.append(replacement)
+        else:
+            self._documents[existing_index] = replacement
+        self.pipeline.index_documents(self._documents)
+        return len(self.pipeline.chunks)
 
-    def stream(self, prompt: str):
-        stream = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            stream=True
+    def query_stream(
+        self,
+        question: str,
+        chat_history: Optional[list] = None,
+        top_k: int = 5,
+        mode: str = "hybrid",
+    ) -> Tuple[Iterator[str], list]:
+        """Run a checked RAG query and return answer chunks plus provenance."""
+        chunks, sources, _ = self.query_with_details(
+            question,
+            chat_history=chat_history,
+            top_k=top_k,
+            mode=mode,
         )
+        return chunks, sources
 
-        for chunk in stream:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                yield delta
+    def query_with_details(
+        self,
+        question: str,
+        chat_history: Optional[list] = None,
+        top_k: int = 5,
+        mode: str = "hybrid",
+    ) -> Tuple[Iterator[str], list, dict]:
+        """Return answer chunks, provenance, and checked pipeline details."""
+        del chat_history  # Conversation history is not sent into the medical prompt.
+        if mode not in {"hybrid", "dense", "sparse"}:
+            raise ValueError(f"Unsupported retrieval mode: {mode}")
 
-
-# -------------------------
-# LLM FACTORY
-# -------------------------
-def get_llm(provider: str, api_key: str, model: str, temperature: float = 0.7, max_tokens: int = 512) -> BaseLLM:
-    provider = provider.lower()
-
-    if provider == "hf":
-        return HFLLM(api_key, model, temperature, max_tokens)
-
-    elif provider == "cohere":
-        return CohereLLM(api_key, model, temperature, max_tokens)
-
-    elif provider == "openai":
-        return OpenAILLM(api_key, model, temperature, max_tokens)
-
-    else:
-        raise ValueError(f"Unsupported provider: {provider}")
-
-
-# -------------------------
-# QA SYSTEM (RAG CORE)
-# -------------------------
-class QASystem:
-    def __init__(self):
-        self.vectorstore = self._load_index()
-        self.llm: BaseLLM | None = None
-
-    def set_llm(self, provider: str, api_key: str, model: str, temperature: float = 0.7, max_tokens: int = 512):
-        self.llm = get_llm(
-            provider=provider,
-            api_key=api_key,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens
+        response = self.pipeline.query(
+            question,
+            top_k=top_k,
+            retrieval_mode=mode,
+            use_reranking=False,
         )
+        sources = [dict(source) for source in response.sources]
+        chunks = re.findall(r"\S+\s*", response.answer)
+        details = {
+            "is_grounded": bool(getattr(response, "is_grounded", False)),
+            "warnings": list(getattr(response, "warnings", [])),
+            "retrieval_time_ms": float(
+                getattr(response, "retrieval_time_ms", 0.0)
+            ),
+            "generation_time_ms": float(
+                getattr(response, "generation_time_ms", 0.0)
+            ),
+        }
+        return iter(chunks), sources, details
 
-    def build_index(self, texts: List[str]):
-        """
-        Build FAISS index from multiple documents
-        """
-        if not texts:
-            raise ValueError("No texts provided")
+    def retrieve(
+        self,
+        question: str,
+        top_k: int = 5,
+        mode: str = "hybrid",
+    ) -> list:
+        """Retrieve and return ranked source evidence without generating an answer."""
+        if mode not in {"hybrid", "dense", "sparse"}:
+            raise ValueError(f"Unsupported retrieval mode: {mode}")
+        if top_k < 1:
+            raise ValueError("top_k must be at least 1.")
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError("The query must be a non-empty string.")
+        if self.pipeline.vectorstore is None:
+            raise RuntimeError("Index documents before running retrieval.")
 
-        # Combine all texts and split into chunks
-        combined_text = "\n\n".join(texts)
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,
-            chunk_overlap=100
-        )
-        docs = splitter.split_text(combined_text)
+        from rag.safety import process_safe_query
 
-        # Create embeddings and FAISS index
-        embeddings = get_embeddings()
-        self.vectorstore = FAISS.from_texts(docs, embeddings)
-        self.vectorstore.save_local(INDEX_PATH)
+        safety_result = process_safe_query(question)
+        if not safety_result.allowed:
+            raise ValueError(safety_result.response)
 
-    def _load_index(self):
-        # Check for both FAISS index files
-        faiss_file = os.path.join(INDEX_PATH, "index.faiss")
-        pkl_file = os.path.join(INDEX_PATH, "index.pkl")
+        if mode == "hybrid":
+            from rag.hybrid_retriever import HybridRetriever
 
-        if os.path.exists(faiss_file) and os.path.exists(pkl_file):
-            try:
-                return FAISS.load_local(
-                    INDEX_PATH,
-                    get_embeddings(),
-                    allow_dangerous_deserialization=True
+            response = HybridRetriever(
+                self.pipeline.vectorstore,
+                self.pipeline.chunks,
+            ).retrieve(safety_result.query, k=top_k)
+            retrieved = response["fused_results"][:top_k]
+            metadata_by_content = {}
+            for result in response["dense_results"]:
+                metadata_by_content.setdefault(result.content, result.metadata)
+            for result in response["sparse_results"]:
+                document = result["document"]
+                metadata_by_content.setdefault(document.content, document.metadata)
+            candidates = [
+                (content, metadata_by_content[content], score)
+                for content, score in retrieved
+                if content in metadata_by_content
+            ]
+        elif mode == "dense":
+            from rag.retriever import BiomedicalRetriever
+
+            response = BiomedicalRetriever(self.pipeline.vectorstore).retrieve(
+                safety_result.query,
+                k=top_k,
+            )
+            candidates = [
+                (
+                    result.content,
+                    result.metadata,
+                    result.similarity_score,
                 )
-            except Exception as e:
-                # If loading fails, return None to start fresh
-                print(f"Warning: Failed to load existing index: {e}")
-                return None
-        return None
+                for result in response["results"]
+            ]
+        else:
+            from rag.bm25_retriever import BM25Retriever
 
-    def retrieve(self, query: str, k: int = 3):
-        if not self.vectorstore:
-            return []
-        return self.vectorstore.similarity_search(query, k=k)
+            response = BM25Retriever(self.pipeline.documents).search(
+                safety_result.query,
+                k=top_k,
+            )
+            candidates = [
+                (
+                    result["document"].content,
+                    result["document"].metadata,
+                    result["score"],
+                )
+                for result in response
+            ]
 
-    def answer(self, query: str) -> str:
-        if not self.vectorstore:
-            return "No document uploaded."
-
-        if not self.llm:
-            return "LLM not initialized."
-
-        docs = self.retrieve(query)
-
-        context = "\n\n".join([d.page_content for d in docs])
-
-        prompt = f"""
-Answer ONLY from the context below.
-
-Context:
-{context}
-
-Question: {query}
-
-Answer:
-"""
-        return self.llm.invoke(prompt)
+        return [
+            {
+                "content": content,
+                "metadata": dict(metadata),
+                "score": float(score),
+                "rank": rank,
+            }
+            for rank, (content, metadata, score) in enumerate(candidates, 1)
+        ]

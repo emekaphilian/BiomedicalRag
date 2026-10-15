@@ -85,6 +85,7 @@ class BiomedicalRAGPipeline:
         question: str,
         top_k: int = 5,
         use_reranking: bool = True,
+        retrieval_mode: str = "hybrid",
     ) -> RAGResponse:
         """Retrieve evidence and generate a safety-checked grounded answer."""
         if self.vectorstore is None:
@@ -95,6 +96,8 @@ class BiomedicalRAGPipeline:
             raise ValueError("The query must be a non-empty string.")
         if top_k < 1:
             raise ValueError("top_k must be at least 1.")
+        if retrieval_mode not in {"hybrid", "dense", "sparse"}:
+            raise ValueError("retrieval_mode must be hybrid, dense, or sparse.")
 
         from rag.disclaimer import append_disclaimer
         from rag.safety import process_safe_query
@@ -127,14 +130,16 @@ class BiomedicalRAGPipeline:
             )
             self._generation_pipelines[use_reranking] = generation_pipeline
 
-        result = generation_pipeline.generate(
-            safety_result.query,
-            k=top_k,
-            retrieval_k=max(
+        generate_kwargs = {
+            "k": top_k,
+            "retrieval_k": max(
                 top_k,
                 self.config.get("retriever", {}).get("retrieval_k", 20),
             ),
-        )
+        }
+        if retrieval_mode != "hybrid":
+            generate_kwargs["retrieval_mode"] = retrieval_mode
+        result = generation_pipeline.generate(safety_result.query, **generate_kwargs)
 
         validation = result["validation"]
         warnings = list(validation.get("issues", []))
@@ -148,11 +153,18 @@ class BiomedicalRAGPipeline:
         answer = append_disclaimer(answer)
 
         evidence = result["compression"].get("evidence", [])
-        sources = [
-            dict(item["metadata"])
-            for item in evidence
-            if isinstance(item.get("metadata"), dict)
-        ]
+        sources = []
+        for item in evidence:
+            metadata = item.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            sources.append(
+                {
+                    **metadata,
+                    "text": item.get("content", ""),
+                    "rerank_score": item.get("rerank_score", 0.0),
+                }
+            )
         timings = result.get("timings", {})
 
         return RAGResponse(

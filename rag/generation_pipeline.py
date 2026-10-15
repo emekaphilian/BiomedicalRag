@@ -50,12 +50,13 @@ class GroundedGenerationPipeline:
         self.generator = GroundedGenerator(
             model_name=generator_config.get("model_name", "gpt-4o"),
             api_key=generator_config.get("api_key"),
+            provider=generator_config.get("provider", "openai"),
         )
         self.generator_config = generator_config
         self.validator = PostGenerationValidator()
         self.use_mock = use_mock
 
-    def generate(self, query, k=3, retrieval_k=20):
+    def generate(self, query, k=3, retrieval_k=20, retrieval_mode="hybrid"):
         """
         Generate grounded answer end-to-end.
         
@@ -83,17 +84,34 @@ class GroundedGenerationPipeline:
                     document.content,
                     document.metadata,
                 )
+            if retrieval_mode == "dense":
+                selected_results = [
+                    (result.content, result.similarity_score)
+                    for result in hybrid_result["dense_results"]
+                ]
+            elif retrieval_mode == "sparse":
+                selected_results = [
+                    (result["document"].content, result["score"])
+                    for result in hybrid_result["sparse_results"]
+                ]
+            else:
+                selected_results = hybrid_result["fused_results"]
             ranked_results = [
                 {
                     "content": content,
                     "metadata": metadata_by_content[content],
                     "rerank_score": score,
                 }
-                for content, score in hybrid_result["fused_results"]
+                for content, score in selected_results
                 if content in metadata_by_content
             ][:k]
             retrieval_result = {
                 **hybrid_result,
+                "grounded": (
+                    any(score > 0 for _, score in selected_results)
+                    if retrieval_mode == "sparse"
+                    else hybrid_result["grounded"]
+                ),
                 "reranked_results": ranked_results,
             }
         retrieval_time_ms = (perf_counter() - retrieval_started) * 1000

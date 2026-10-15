@@ -9,13 +9,13 @@ class GroundedGenerator:
     Generates biomedical answers from retrieved evidence.
     
     Features:
-    - OpenAI API integration (gpt-4o, gpt-4.1)
+    - OpenAI, Cohere, and Hugging Face API integrations
     - Mock generation for testing
     - Structured output with metadata
     - Citation tracking
     """
 
-    def __init__(self, model_name="gpt-4o", api_key=None):
+    def __init__(self, model_name="gpt-4o", api_key=None, provider="openai"):
         """
         Initialize LLM generator.
         
@@ -25,16 +25,32 @@ class GroundedGenerator:
         """
         self.model_name = model_name
         self.api_key = api_key
+        self.provider = provider.lower()
         
         # Lazy import to avoid hard dependency
         self.client = None
 
     def _get_client(self):
-        """Get OpenAI client (lazy initialization)."""
+        """Get the selected provider client on first use."""
         if self.client is None:
             try:
-                from openai import OpenAI
-                self.client = OpenAI(api_key=self.api_key)
+                if self.provider == "openai":
+                    from openai import OpenAI
+
+                    self.client = OpenAI(api_key=self.api_key)
+                elif self.provider == "cohere":
+                    import cohere
+
+                    self.client = cohere.ClientV2(api_key=self.api_key)
+                elif self.provider == "huggingface":
+                    from huggingface_hub import InferenceClient
+
+                    self.client = InferenceClient(
+                        model=self.model_name,
+                        token=self.api_key,
+                    )
+                else:
+                    raise ValueError(f"Unsupported LLM provider: {self.provider}")
             except ImportError:
                 return None
         return self.client
@@ -57,17 +73,39 @@ class GroundedGenerator:
             if client is None:
                 return self.generate_mock(prompt_dict)
             
-            response = client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": prompt_dict["system"]},
-                    {"role": "user", "content": prompt_dict["user"]}
-                ],
-                max_tokens=max_tokens,
-                temperature=temperature
-            )
-            
-            answer = response.choices[0].message.content
+            if self.provider == "openai":
+                response = client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": prompt_dict["system"]},
+                        {"role": "user", "content": prompt_dict["user"]},
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                answer = response.choices[0].message.content
+            elif self.provider == "cohere":
+                response = client.chat(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": prompt_dict["system"]},
+                        {"role": "user", "content": prompt_dict["user"]},
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                answer = response.message.content[0].text
+            else:
+                answer = client.text_generation(
+                    f"{prompt_dict['system']}\n\n{prompt_dict['user']}",
+                    max_new_tokens=max_tokens,
+                    temperature=temperature,
+                    return_full_text=False,
+                )
+
+            if not answer:
+                raise ValueError("The selected LLM returned an empty answer.")
+            answer = answer.strip()
             
             return {
                 "answer": answer,

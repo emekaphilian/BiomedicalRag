@@ -53,6 +53,18 @@ This project implements a **domain-specific Medical Question Answering chatbot**
 
 The demo requires a Cohere API key (free tier works). You can get one at [dashboard.cohere.com](https://dashboard.cohere.com/api-keys).
 
+The Streamlit research dashboard provides Overview, Knowledge Base, RAG Playground,
+Evaluation Lab, Safety & Governance, and Audit History sections. Its retrieval
+evaluation is manually labeled and source-level; answer-quality assessments are
+human rubric ratings rather than automated or clinical validation. Evaluation runs
+capture the labels, ranked evidence, and a non-secret configuration fingerprint.
+The Governance section includes an operator-authored bias/fairness report and an
+impact × likelihood ethical-risk triage score. The security posture explicitly
+identifies missing application login and PII/PHI redaction; it does not certify
+enterprise security. Session activity, configuration snapshots, and remediation
+history remain in memory until exported as JSON. This prototype is for research
+use and is not a clinically validated system.
+
 ---
 
 ## Architecture
