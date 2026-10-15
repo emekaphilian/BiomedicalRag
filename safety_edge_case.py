@@ -1,5 +1,5 @@
 ﻿#!/usr/bin/env python
-"""Quick verification of safety-related edge cases."""
+"""Standalone diagnostic for safety-related edge cases."""
 
 import os
 import sys
