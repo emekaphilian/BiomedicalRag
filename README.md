@@ -69,6 +69,30 @@ use and is not a clinically validated system.
 
 ## Architecture
 
+### Application boundary
+
+The React dashboard calls a single FastAPI application. FastAPI delegates query
+and ingestion work to the existing `RAGService` and Python RAG pipeline, and
+exposes the research metrics, answer audit, responsible-AI, and security-control
+helpers as API services. Audit and governance records are isolated by dashboard
+session but currently remain in API-process memory.
+
+```text
+React + TypeScript + Vite
+          │ JSON / multipart HTTP
+          ▼
+FastAPI (app.main:app)
+   ├── session, query, upload, retrieval
+   ├── audit, evaluation, governance, security
+   └── RAGService (app.services)
+               │
+               ▼
+     Existing Python RAG pipeline
+```
+
+The Streamlit dashboard remains available during migration; it uses the same
+Python pipeline directly.
+
 ```
 User Query
     │
@@ -131,11 +155,15 @@ User Query
 
 ```
 Biomedical-RAG/
-├── dashboard/
-│   └── app.py              ← Streamlit entry point
+├── frontend/
+│   ├── src/                ← React + TypeScript research dashboard
+│   └── package.json        ← Vite build and frontend tests
 ├── app/
-│   ├── services.py         ← RAG logic, LLM integration
-│   └── main.py             ← FastAPI backend (optional)
+│   ├── api.py              ← Canonical FastAPI endpoints and session services
+│   ├── main.py             ← FastAPI entry point: app.main:app
+│   └── services.py         ← Shared RAG service adapter
+├── dashboard/
+│   └── app.py              ← Existing Streamlit dashboard
 ├── rag/
 │   ├── retriever.py        ← Hybrid FAISS + BM25 retrieval
 │   ├── reranker.py         ← Cross-encoder reranking
@@ -182,6 +210,53 @@ Stabilisation improvements (confidence thresholding, query classification, refus
 ---
 
 ## Quick Start
+
+### React + FastAPI dashboard (recommended)
+
+The React application is the new dashboard frontend. The biomedical RAG pipeline,
+answer checks, and research/governance services remain in Python. Configure provider
+credentials only on the API server; they are never sent to the browser.
+
+```powershell
+# Install Python dependencies in your active Python 3.11 environment
+pip install -r requirements.txt
+$env:COHERE_API_KEY = "your-key"
+uvicorn app.main:app --reload
+```
+
+In a second terminal:
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173`. Set `VITE_API_URL` at frontend build/dev time if the
+API is not at `http://127.0.0.1:8000`; configure `BIOMEDRAG_CORS_ORIGINS` on the
+API server with a comma-separated allowlist when using another frontend origin.
+The API exposes `/api/health`, session configuration, document upload, query and
+retrieval, answer/retrieval evaluation, audit export, human review, security scan,
+fairness screening, and operator risk endpoints. Use OpenAI or Hugging Face by
+setting `OPENAI_API_KEY` or `HUGGINGFACE_API_KEY` on the API server instead.
+
+Dashboard sessions, uploaded documents, evaluations, and audit events are held in
+API-process memory, matching the prototype's previous session-scoped behavior.
+They are not durable and may be lost when the server restarts; use the audit JSON
+export to retain a record. PII and prompt-attack checks are heuristic and do not
+constitute comprehensive protection, enterprise security certification, or
+clinical validation.
+
+### Existing Streamlit dashboard
+
+The Streamlit app remains available during migration and continues to use the same
+Python RAG pipeline:
+
+```bash
+streamlit run dashboard/app.py
+```
+
+It is still the route for Streamlit Cloud deployments documented below.
 
 ### Prerequisites
 

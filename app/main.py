@@ -1,8 +1,5 @@
- # FastAPI entry point
+"""Canonical FastAPI entry point (run with ``uvicorn app.main:app``)."""
 
-from fastapi import FastAPI
-from .routers import qa_router
+from .api import app
 
-app = FastAPI()
-
-app.include_router(qa_router.router)
+__all__ = ["app"]

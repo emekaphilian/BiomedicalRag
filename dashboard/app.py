@@ -31,6 +31,7 @@ from dashboard.responsible_ai import (
     compare_responses,
     ethical_risk_score as observed_ethical_risk_score,
     fairness_report as build_fairness_report,
+    operator_ethical_risk_score,
 )
 from dashboard.security_controls import find_pii, guard_question, redact_pii
 
@@ -396,13 +397,15 @@ def _init():
         "fairness_reports": [],
         "llm_ready":        False,
         "provider":         "cohere",
-        "model":            "command-r-plus",
+        "model":            "command-a-plus-05-2026",
         "top_k":            5,
         "retrieval_mode":   "hybrid",
         "query_class":      "factoid",
         "settings_open":    False,
         "total_queries":    0,
         "avg_latency_ms":   0.0,
+        "playground_question_input": "",
+        "clear_playground_question": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -440,6 +443,18 @@ def _configuration_snapshot(overrides: dict = None) -> dict:
 
 # ── Lazy import of RAG service ────────────────────────────────────────────────
 def _load_service(provider: str, model: str, api_key: str):
+    service, error = SERVICE_LOADER.load(provider, model, api_key)
+    if error or service is None:
+        return service, error
+
+    required_attributes = ("total_documents", "source_names", "refresh_default_corpus")
+    if all(hasattr(service, attribute) for attribute in required_attributes):
+        return service, None
+
+    # A long-running Streamlit process may still have an adapter cached from
+    # before the prepared-corpus interface was added. Discard it and rebuild
+    # immediately so one Initialise click is enough to recover.
+    SERVICE_LOADER.clear()
     return SERVICE_LOADER.load(provider, model, api_key)
 
 
@@ -463,7 +478,10 @@ with st.sidebar:
         "huggingface":  "Hugging Face",
     }
     model_map = {
-        "cohere":       ["command-r-plus", "command-r", "command-nightly"],
+        "cohere": [
+            "command-a-plus-05-2026",
+            "command-a-03-2025",
+        ],
         "openai":       ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
         "huggingface":  ["microsoft/DialoGPT-medium", "google/flan-t5-large", "gpt2"],
     }
@@ -485,14 +503,27 @@ with st.sidebar:
     # API key
     api_key_val = _get_saved_api_key(st.session_state.provider)
 
-    if api_key_val:
-        st.markdown('<span class="pill pill-green">✓ API key loaded from configuration</span>', unsafe_allow_html=True)
-    else:
-        st.caption("No saved API key found. Enter one below to initialize the provider.")
-        api_key_val = st.text_input(
-            "API Key",
-            type="password",
-            placeholder=f"Enter your {sel_prov} API key",
+    with st.form("llm_initialization_form"):
+        if api_key_val:
+            st.markdown(
+                '<span class="pill pill-green">✓ API key loaded from configuration</span>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.caption(
+                "No saved API key found. Enter one below, then connect the provider."
+            )
+            api_key_val = st.text_input(
+                "API Key",
+                type="password",
+                placeholder=f"Enter your {sel_prov} API key",
+                key="llm_api_key_input",
+            )
+
+        initialize_llm = st.form_submit_button(
+            "⚡ Re-initialise LLM" if st.session_state.rag_service else "⚡ Initialise LLM",
+            use_container_width=True,
+            type="primary",
         )
 
     active_service = st.session_state.rag_service
@@ -501,15 +532,11 @@ with st.sidebar:
         if active_service else None,
         {"provider": st.session_state.provider, "model": st.session_state.model},
     ))
-    if st.button(
-        "⚡ Re-initialise LLM" if pending_model_change else "⚡ Initialise LLM",
-        use_container_width=True,
-        type="primary",
-    ):
+    if initialize_llm:
         if not api_key_val:
             st.error("API key required.")
         else:
-            with st.spinner("Connecting…"):
+            with st.spinner("Connecting and loading the biomedical knowledge base…"):
                 svc, err = _load_service(
                     st.session_state.provider,
                     st.session_state.model,
@@ -534,113 +561,118 @@ with st.sidebar:
     st.markdown("### 📄 Knowledge Base")
 
     uploaded = st.file_uploader(
-        "Upload biomedical documents",
+        "Add more knowledge documents (optional)",
         type=["pdf", "docx", "txt"],
         accept_multiple_files=True,
-        help="MedQuAD exports, clinical guidelines, research papers, textbooks",
+        help=(
+            "The prepared biomedical knowledge base is loaded automatically. "
+            "Upload MedQuAD exports, clinical guidelines, research papers, or "
+            "textbooks here to add to it."
+        ),
     )
 
-    if uploaded:
-        existing_records = {
-            record["filename"]: record
-            for record in st.session_state.document_records
-        }
-        uploaded_with_hashes = [
-            (file, hashlib.sha256(file.getvalue()).hexdigest())
-            for file in uploaded
-        ]
-        new_files = [
-            (file, file_hash)
-            for file, file_hash in uploaded_with_hashes
-            if classify_upload(file.name, file_hash, st.session_state.document_records) != "duplicate"
-        ]
-        changed_names = [
-            file.name for file, _ in new_files
-            if file.name in existing_records
-        ]
-        if changed_names:
-            st.warning(
-                "Updated content detected for: "
-                + ", ".join(changed_names)
-                + ". Indexing will retain a distinct content-hash provenance key."
-            )
-        if new_files:
-            if st.button(
-                f"📥 Index or re-index {len(new_files)} file(s)",
-                use_container_width=True,
-            ):
-                svc = st.session_state.rag_service
-                if not svc:
-                    st.warning("Initialise the LLM first.")
-                else:
-                    bar = st.progress(0)
-                    total_chunks = 0
-                    for i, (f, file_hash) in enumerate(new_files):
-                        with st.spinner(f"Processing {f.name}…"):
-                            try:
-                                previous_chunks = svc.total_chunks
-                                file_bytes = f.getvalue()
-                                source_name = unique_source_name(
-                                    f.name, file_hash, st.session_state.document_records
-                                )
-                                n = svc.ingest(file_bytes, source_name)
-                                previous_record = existing_records.get(f.name)
-                                file_chunks = (
-                                    n - previous_chunks
-                                    + (previous_record.get("chunks", 0) if previous_record else 0)
-                                )
-                                total_chunks += file_chunks
-                                if f.name not in st.session_state.docs_indexed:
-                                    st.session_state.docs_indexed.append(f.name)
-                                new_record = {
-                                    "filename": f.name,
-                                    "file_type": f.name.rsplit(".", 1)[-1].upper(),
-                                    "size_bytes": f.size,
-                                    "chunks": file_chunks,
-                                    "sha256": file_hash,
-                                    "indexed_at": datetime.now(timezone.utc).isoformat(),
-                                    "source": source_name,
-                                }
-                                if previous_record:
-                                    # Keep prior versions in the session manifest for lineage.
-                                    new_record["filename"] = f.name
-                                    new_record["source"] = source_name
-                                    st.session_state.document_records.append(new_record)
-                                    existing_records[f.name] = new_record
-                                else:
-                                    st.session_state.document_records.append(new_record)
-                                    existing_records[f.name] = new_record
-                                st.session_state.audit_events.append({
-                                    "event": "document_indexed",
-                                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                                    "filename": f.name,
-                                    "chunks": file_chunks,
-                                    "provider": svc.provider,
-                                    "model": svc.model,
-                                    "configuration": _configuration_snapshot({
-                                        "provider": svc.provider,
-                                        "model": svc.model,
-                                    }),
-                                })
-                            except Exception as e:
-                                st.error(f"{f.name}: {e}")
-                                st.session_state.audit_events.append({
-                                    "event": "document_indexing_failed",
-                                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                                    "filename": f.name,
-                                    "error": str(e),
-                                    "provider": svc.provider,
-                                    "model": svc.model,
-                                    "configuration": _configuration_snapshot({
-                                        "provider": svc.provider,
-                                        "model": svc.model,
-                                    }),
-                                })
-                        bar.progress((i + 1) / len(new_files))
-                    bar.empty()
-                    st.success(f"Indexed {total_chunks:,} chunks from {len(new_files)} file(s)")
+    uploaded = uploaded or []
+    existing_records = {
+        record["filename"]: record
+        for record in st.session_state.document_records
+    }
+    uploaded_with_hashes = [
+        (file, hashlib.sha256(file.getvalue()).hexdigest())
+        for file in uploaded
+    ]
+    new_files = [
+        (file, file_hash)
+        for file, file_hash in uploaded_with_hashes
+        if classify_upload(file.name, file_hash, st.session_state.document_records) != "duplicate"
+    ]
+    changed_names = [
+        file.name for file, _ in new_files
+        if file.name in existing_records
+    ]
+    if changed_names:
+        st.warning(
+            "Updated content detected for: "
+            + ", ".join(changed_names)
+            + ". Indexing will retain a distinct content-hash provenance key."
+        )
+
+    index_label = (
+        f"📥 Index {len(new_files)} selected file(s)"
+        if new_files else "📥 Select files to enable indexing"
+    )
+    index_clicked = st.button(
+        index_label,
+        use_container_width=True,
+        disabled=not new_files,
+        key="index_knowledge_documents",
+    )
+    if index_clicked:
+        svc = st.session_state.rag_service
+        if not svc:
+            st.warning("Initialise the LLM first.")
         else:
-            st.info("All files already indexed.")
+            bar = st.progress(0)
+            total_chunks = 0
+            for i, (f, file_hash) in enumerate(new_files):
+                with st.spinner(f"Processing {f.name}…"):
+                    try:
+                        previous_chunks = svc.total_chunks
+                        file_bytes = f.getvalue()
+                        source_name = unique_source_name(
+                            f.name, file_hash, st.session_state.document_records
+                        )
+                        n = svc.ingest(file_bytes, source_name)
+                        previous_record = existing_records.get(f.name)
+                        file_chunks = (
+                            n - previous_chunks
+                            + (previous_record.get("chunks", 0) if previous_record else 0)
+                        )
+                        total_chunks += file_chunks
+                        if f.name not in st.session_state.docs_indexed:
+                            st.session_state.docs_indexed.append(f.name)
+                        new_record = {
+                            "filename": f.name,
+                            "file_type": f.name.rsplit(".", 1)[-1].upper(),
+                            "size_bytes": f.size,
+                            "chunks": file_chunks,
+                            "sha256": file_hash,
+                            "indexed_at": datetime.now(timezone.utc).isoformat(),
+                            "source": source_name,
+                        }
+                        # Preserve changed versions as separate manifest entries.
+                        st.session_state.document_records.append(new_record)
+                        existing_records[f.name] = new_record
+                        st.session_state.audit_events.append({
+                            "event": "document_indexed",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "filename": f.name,
+                            "chunks": file_chunks,
+                            "provider": svc.provider,
+                            "model": svc.model,
+                            "configuration": _configuration_snapshot({
+                                "provider": svc.provider,
+                                "model": svc.model,
+                            }),
+                        })
+                    except Exception as e:
+                        st.error(f"{f.name}: {e}")
+                        st.session_state.audit_events.append({
+                            "event": "document_indexing_failed",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "filename": f.name,
+                            "error": str(e),
+                            "provider": svc.provider,
+                            "model": svc.model,
+                            "configuration": _configuration_snapshot({
+                                "provider": svc.provider,
+                                "model": svc.model,
+                            }),
+                        })
+                bar.progress((i + 1) / len(new_files))
+            bar.empty()
+            st.success(f"Indexed {total_chunks:,} chunks from {len(new_files)} file(s)")
+    elif uploaded and not new_files:
+        st.info("All selected documents are already indexed with matching content.")
 
     if st.session_state.document_records:
         for record in st.session_state.document_records:
@@ -699,9 +731,41 @@ with st.sidebar:
 
 # ── Main dashboard ────────────────────────────────────────────────────────────
 svc = st.session_state.rag_service
+if svc and not all(
+    hasattr(svc, attribute)
+    for attribute in ("total_documents", "source_names")
+):
+    SERVICE_LOADER.clear()
+    st.session_state.rag_service = None
+    st.session_state.llm_ready = False
+    svc = None
+    st.warning(
+        "The active RAG service predates the current knowledge-base interface. "
+        "Please re-initialise the LLM to load the prepared corpus."
+    )
+if svc and hasattr(svc, "refresh_default_corpus"):
+    try:
+        svc.refresh_default_corpus()
+    except Exception as error:
+        st.warning(f"Could not load the prepared biomedical corpus: {error}")
 llm_ok = svc is not None
-docs_ok = bool(st.session_state.docs_indexed)
 n_chunks = svc.total_chunks if svc else 0
+n_docs = (
+    getattr(svc, "total_documents", len(st.session_state.docs_indexed))
+    if svc else 0
+)
+source_names = (
+    getattr(
+        svc,
+        "source_names",
+        sorted({
+            record.get("source", "Unknown")
+            for record in st.session_state.document_records
+        }),
+    )
+    if svc else []
+)
+docs_ok = n_chunks > 0
 query_events = [
     event for event in st.session_state.audit_events
     if event.get("event") == "query"
@@ -783,7 +847,7 @@ st.markdown(
     f"<span class='pill {'pill-green' if llm_ok else 'pill-red'}'>"
     f"{'Connected' if llm_ok else 'LLM not connected'}</span> &nbsp; "
     f"<span class='pill {'pill-green' if docs_ok else 'pill-blue'}'>"
-    f"{len(st.session_state.document_records)} documents · {n_chunks:,} chunks</span> &nbsp; "
+    f"{n_docs} documents · {n_chunks:,} chunks</span> &nbsp; "
     f"<span class='pill pill-blue'>{st.session_state.retrieval_mode.upper()} · "
     f"k={st.session_state.top_k}</span> &nbsp; "
     f"<span class='phase-badge'>RESEARCH USE ONLY · SESSION-SCOPED</span>",
@@ -809,7 +873,7 @@ with overview_tab:
         "claim durable corpus storage, clinical validation, or production monitoring."
     )
     metric_cols = st.columns(5)
-    metric_cols[0].metric("Indexed documents", len(st.session_state.docs_indexed))
+    metric_cols[0].metric("Indexed documents", n_docs)
     metric_cols[1].metric("Indexed chunks", f"{n_chunks:,}")
     metric_cols[2].metric("Successful queries", len(successful_queries))
     metric_cols[3].metric(
@@ -855,17 +919,19 @@ with overview_tab:
 with knowledge_tab:
     st.subheader("Knowledge Base")
     st.info(
-        "Documents are held in the active RAG service for this session. They are "
-        "not durably stored by this dashboard; use the session reset only when "
-        "you are ready to discard the in-memory index."
+        "The prepared biomedical corpus is indexed automatically when the service "
+        "connects. Uploaded documents are added to that in-memory index for this "
+        "session; the dashboard does not persist uploaded files or the combined index."
     )
     kb_metrics = st.columns(3)
-    kb_metrics[0].metric("Documents", len(st.session_state.document_records))
+    kb_metrics[0].metric("Documents", n_docs)
     kb_metrics[1].metric("Chunks", f"{n_chunks:,}")
     kb_metrics[2].metric(
-        "Indexed source bytes",
+        "Uploaded source bytes",
         f"{sum(item['size_bytes'] for item in st.session_state.document_records):,}",
     )
+    if source_names:
+        st.caption("Indexed sources: " + ", ".join(source_names))
     if st.session_state.document_records:
         st.markdown("#### Document metadata and lineage")
         st.dataframe(
@@ -885,6 +951,11 @@ with knowledge_tab:
         st.caption(
             "Per-file chunk counts are calculated from the index total before and "
             "after each upload; this session manifest is not persisted."
+        )
+    elif n_docs:
+        st.caption(
+            "No additional documents have been uploaded in this session. "
+            "The prepared corpus above is available for retrieval."
         )
     else:
         st.warning("No documents indexed. Upload PDF, DOCX, or TXT files from the sidebar.")
@@ -909,7 +980,8 @@ with playground_tab:
                 <div class="empty-icon">🔬</div>
                 <div class="empty-title">READY FOR BIOMEDICAL QUERIES</div>
                 <div class="empty-hint">
-                    Connect an LLM and index documents in the sidebar to begin.
+                    Connect an LLM to query the prepared biomedical knowledge base.
+                    Upload additional documents from the sidebar to expand it.
                     <br><br><strong>Example:</strong>
                     "How does Parkinson's disease affect dopamine?"
                 </div>
@@ -927,7 +999,23 @@ with playground_tab:
                 with st.chat_message("assistant"):
                     st.markdown(turn["content"])
                     details = turn.get("details", {})
-                    status = "Grounded" if details.get("is_grounded") else "Not grounded"
+                    warnings = details.get("warnings", [])
+                    evidence_retrieved = details.get(
+                        "retrieval_grounded", details.get("is_grounded", False)
+                    )
+                    answer_validated = details.get(
+                        "validation_passed", not bool(warnings)
+                    )
+                    if evidence_retrieved and not answer_validated:
+                        status = "Evidence retrieved · answer withheld"
+                    elif warnings:
+                        status = "Answer withheld"
+                    else:
+                        status = (
+                            "Grounded"
+                            if details.get("is_grounded")
+                            else "Not grounded"
+                        )
                     st.caption(
                         f"{status} · {len(turn.get('sources', []))} sources · "
                         f"{turn.get('provider', st.session_state.provider)} · "
@@ -935,29 +1023,48 @@ with playground_tab:
                         f"k={turn.get('top_k', st.session_state.top_k)} · "
                         f"{turn.get('latency_ms', 0) / 1000:.1f} s"
                     )
+                    if warnings:
+                        st.warning(
+                            "Generation / validation: "
+                            + "; ".join(map(str, warnings))
+                        )
 
-        with st.form("playground_query_form", clear_on_submit=True):
+        if st.session_state.clear_playground_question:
+            st.session_state.playground_question_input = ""
+            st.session_state.clear_playground_question = False
+
+        with st.form("playground_query_form", clear_on_submit=False):
             input_col, send_col = st.columns([5, 1])
             with input_col:
                 question = st.text_input(
                     "Ask a biomedical question",
                     placeholder="Ask a biomedical question…",
                     label_visibility="collapsed",
-                    disabled=not (llm_ok and docs_ok),
+                    key="playground_question_input",
                 )
             with send_col:
                 submitted = st.form_submit_button(
                     "Send",
                     type="primary",
                     use_container_width=True,
-                    disabled=not (llm_ok and docs_ok),
                 )
         if not llm_ok:
-            st.caption("Connect an LLM using the sidebar controls.")
+            st.caption("You can draft a question now. Connect an LLM before sending it.")
         elif not docs_ok:
-            st.caption("Index at least one document using the sidebar controls.")
+            st.caption(
+                "The prepared corpus is not available in this session yet. "
+                "Upload and index a document only if you want to add knowledge."
+            )
 
-        if submitted and question.strip():
+        if submitted and question.strip() and not llm_ok:
+            st.warning("Connect an LLM using the sidebar controls before sending this question.")
+        elif submitted and question.strip() and not docs_ok:
+            st.warning(
+                "No indexed knowledge is available in this session. "
+                "Re-initialise the LLM to load the prepared corpus, or upload "
+                "and index a document to add knowledge."
+            )
+        elif submitted and question.strip():
             guard = guard_question(question)
             safe_question = guard.sanitized
             st.session_state.display_history.append({"role": "user", "content": safe_question})
@@ -1017,6 +1124,9 @@ with playground_tab:
                     "sources": [source.get("source", "Unknown") for source in sources],
                     "source_count": len(sources),
                     "is_grounded": details.get("is_grounded"),
+                    "retrieval_grounded": details.get("retrieval_grounded"),
+                    "generation_success": details.get("generation_success"),
+                    "validation_passed": details.get("validation_passed"),
                     "warnings": details.get("warnings", []),
                     "audit": answer_audit,
                     "security": {
@@ -1059,6 +1169,7 @@ with playground_tab:
                     "model": svc.model,
                     "configuration": active_configuration,
                 })
+            st.session_state.clear_playground_question = True
             st.rerun()
 
     with evidence_col:
@@ -1119,7 +1230,10 @@ with playground_tab:
                 latest_event.get("id", latest_event.get("timestamp"))
                 if latest_event else ""
             )
-            already_reviewed = latest_event_id in reviewed_event_ids
+            already_reviewed = bool(latest_event_id) and any(
+                review.get("query_event_id") == latest_event_id
+                for review in st.session_state.answer_quality_reviews
+            )
             if already_reviewed:
                 st.success("Reviewed by a human")
             else:
@@ -1345,12 +1459,9 @@ with evaluation_tab:
         "Each run stores the query, relevance labels, ranked source excerpts, "
         "retrieval settings, and configuration fingerprint for reproducibility."
     )
-    if not svc or not st.session_state.document_records:
-        st.info("Connect the service and index documents before running retrieval evaluation.")
+    if not svc or not source_names:
+        st.info("Connect the service and load or upload documents before running retrieval evaluation.")
     else:
-        source_names = sorted({
-            record["source"] for record in st.session_state.document_records
-        })
         with st.form("retrieval_evaluation_form"):
             eval_query = st.text_input("Evaluation query")
             relevant_sources = st.multiselect(
@@ -1630,8 +1741,6 @@ with governance_tab:
         "reviewer-authored observations. The ethical risk score is impact × likelihood "
         "(each rated 1–5), a transparent triage aid rather than an objective or validated score."
     )
-    from dashboard.audit_utils import ethical_risk_score
-
     with st.form("responsible_ai_assessment_form", clear_on_submit=True):
         assessment_title = st.text_input("Assessment title")
         assessment_scope = st.text_input(
@@ -1680,7 +1789,7 @@ with governance_tab:
         if missing_fields:
             st.error("Complete required fields: " + ", ".join(missing_fields))
         else:
-            risk = ethical_risk_score(int(impact), int(likelihood))
+            risk = operator_ethical_risk_score(int(impact), int(likelihood))
             assessment = {
                 "id": datetime.now(timezone.utc).isoformat(),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1778,6 +1887,9 @@ with governance_tab:
                     "timestamp": event["timestamp"],
                     "query": event["query"],
                     "grounded": event.get("is_grounded"),
+                    "evidence retrieved": event.get("retrieval_grounded"),
+                    "generation succeeded": event.get("generation_success"),
+                    "validation passed": event.get("validation_passed"),
                     "source_count": event.get("source_count", 0),
                     "warnings": "; ".join(event.get("warnings", [])),
                 }

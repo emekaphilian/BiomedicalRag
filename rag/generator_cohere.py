@@ -115,7 +115,7 @@ class CohereGeneratorStreaming:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "command-r-plus",
+        model: str = "command-r-plus-08-2024",
     ):
         """
         Initialize streaming generator

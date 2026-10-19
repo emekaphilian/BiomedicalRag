@@ -94,7 +94,7 @@ class GroundedGenerator:
                     max_tokens=max_tokens,
                     temperature=temperature,
                 )
-                answer = response.message.content[0].text
+                answer = self._cohere_response_text(response)
             else:
                 answer = client.text_generation(
                     f"{prompt_dict['system']}\n\n{prompt_dict['user']}",
@@ -118,15 +118,90 @@ class GroundedGenerator:
             }
             
         except Exception as e:
+            error_message = self._safe_error_message(e)
             return {
-                "answer": f"Generation failed: {str(e)}",
+                "answer": f"Generation failed: {error_message}",
                 "query": prompt_dict["query"],
                 "evidence_count": prompt_dict["evidence_count"],
                 "sources": prompt_dict["evidence_sources"],
                 "model": self.model_name,
                 "success": False,
-                "error": str(e)
+                "error": error_message,
             }
+
+    def _safe_error_message(self, error):
+        """Return useful provider diagnostics without dumping response headers."""
+        response = getattr(error, "response", None)
+        status_code = getattr(error, "status_code", None)
+        if status_code is None and response is not None:
+            status_code = getattr(response, "status_code", None)
+
+        body = getattr(error, "body", None)
+        if body is None and response is not None:
+            body = getattr(response, "json_data", None)
+        if isinstance(body, dict):
+            detail = next(
+                (body[key] for key in ("message", "error", "detail") if body.get(key)),
+                None,
+            )
+            if isinstance(detail, dict):
+                detail = detail.get("message") or detail.get("type")
+        else:
+            detail = body
+
+        if detail is None:
+            if isinstance(error, (AttributeError, TypeError, ValueError)):
+                detail = str(error)
+                if not detail and isinstance(error, AttributeError):
+                    traceback = error.__traceback__
+                    while traceback is not None and traceback.tb_next is not None:
+                        traceback = traceback.tb_next
+                    if traceback is not None:
+                        filename = (
+                            traceback.tb_frame.f_code.co_filename
+                            .replace("\\", "/")
+                            .rsplit("/", 1)[-1]
+                        )
+                        detail = (
+                            f"{type(error).__name__} at "
+                            f"{filename}:{traceback.tb_lineno}"
+                        )
+                detail = detail or type(error).__name__
+            else:
+                detail = type(error).__name__
+        detail = " ".join(str(detail).split())
+        if self.api_key:
+            detail = detail.replace(self.api_key, "[redacted]")
+        detail = detail[:400]
+
+        provider = self.provider.capitalize()
+        status = f" (HTTP {status_code})" if status_code else ""
+        return f"{provider} request failed{status}: {detail}"
+
+    @staticmethod
+    def _cohere_response_text(response):
+        """Extract generated text from either Cohere v2 content representation."""
+        message = getattr(response, "message", None)
+        content = getattr(message, "content", None)
+
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, (list, tuple)):
+            text_parts = []
+            for block in content:
+                if isinstance(block, str):
+                    text = block
+                elif isinstance(block, dict):
+                    text = block.get("text")
+                else:
+                    text = getattr(block, "text", None)
+                if isinstance(text, str):
+                    text_parts.append(text)
+            if text_parts:
+                return "".join(text_parts)
+
+        raise ValueError("Cohere response did not contain text content.")
 
     def generate_mock(self, prompt_dict):
         """
@@ -158,4 +233,3 @@ Evidence items: {prompt_dict["evidence_count"]}
             "success": True,
             "error": None
         }
-

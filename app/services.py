@@ -8,6 +8,23 @@ from typing import Iterator, List, Optional, Tuple
 from rag.document import BiomedicalDocument
 from rag.pipeline import BiomedicalRAGPipeline
 
+BASE_CORPUS_DIR = (
+    Path(__file__).resolve().parents[1]
+    / "data"
+    / "processed"
+    / "downloaded_sources"
+)
+
+
+def load_default_corpus() -> List[BiomedicalDocument]:
+    """Load the repository's prepared biomedical corpus when it is available."""
+    if not BASE_CORPUS_DIR.is_dir():
+        return []
+
+    from rag.ingestion import load_normalized_documents
+
+    return load_normalized_documents(BASE_CORPUS_DIR)
+
 
 class RAGService:
     """Expose the upload and query methods expected by the Streamlit UI."""
@@ -21,7 +38,7 @@ class RAGService:
 
         self.provider = provider
         self.model = model
-        self._documents: List[BiomedicalDocument] = []
+        self._documents = load_default_corpus()
         self.pipeline = BiomedicalRAGPipeline(
             {
                 "generator": {
@@ -33,10 +50,41 @@ class RAGService:
                 "retriever": {"retrieval_k": 20},
             }
         )
+        if self._documents:
+            self.pipeline.index_documents(self._documents)
 
     @property
     def total_chunks(self) -> int:
         return len(self.pipeline.chunks)
+
+    @property
+    def total_documents(self) -> int:
+        return len(self._documents)
+
+    @property
+    def source_names(self) -> List[str]:
+        return sorted({
+            str(document.metadata.get("source", "Unknown"))
+            for document in self._documents
+        })
+
+    def refresh_default_corpus(self) -> bool:
+        """Load the prepared corpus if this cached service has no index yet.
+
+        Streamlit can keep a service in its session after the local corpus has
+        been downloaded or generated. Refreshing an empty service here avoids
+        making users upload a document just to unlock the prepared corpus.
+        """
+        if self.pipeline.vectorstore is not None:
+            return False
+
+        documents = load_default_corpus()
+        if not documents:
+            return False
+
+        self._documents = documents
+        self.pipeline.index_documents(self._documents)
+        return True
 
     def ingest(self, file_bytes: bytes, filename: str) -> int:
         """Extract and index one uploaded PDF, DOCX, or UTF-8 text file."""
@@ -117,6 +165,15 @@ class RAGService:
         chunks = re.findall(r"\S+\s*", response.answer)
         details = {
             "is_grounded": bool(getattr(response, "is_grounded", False)),
+            "retrieval_grounded": bool(
+                getattr(response, "retrieval_grounded", getattr(response, "is_grounded", False))
+            ),
+            "generation_success": bool(
+                getattr(response, "generation_success", True)
+            ),
+            "validation_passed": bool(
+                getattr(response, "validation_passed", not getattr(response, "warnings", []))
+            ),
             "warnings": list(getattr(response, "warnings", [])),
             "retrieval_time_ms": float(
                 getattr(response, "retrieval_time_ms", 0.0)

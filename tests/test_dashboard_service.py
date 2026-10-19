@@ -5,6 +5,11 @@ import pytest
 import app.services as services
 
 
+@pytest.fixture(autouse=True)
+def empty_default_corpus(monkeypatch):
+    monkeypatch.setattr(services, "load_default_corpus", lambda: [])
+
+
 class FakePipeline:
     def __init__(self, config):
         self.config = config
@@ -64,6 +69,36 @@ def test_dashboard_service_ingests_text_with_source_metadata(monkeypatch):
     assert service.pipeline.documents[0].metadata["source"] == "guide.txt"
 
 
+def test_dashboard_service_indexes_default_corpus_and_keeps_it_on_upload(
+    monkeypatch,
+):
+    monkeypatch.setattr(services, "BiomedicalRAGPipeline", FakePipeline)
+    base_documents = [
+        services.BiomedicalDocument(
+            content="Preloaded biomedical guidance.",
+            metadata={"source": "MedlinePlus"},
+        )
+    ]
+    monkeypatch.setattr(
+        services,
+        "load_default_corpus",
+        lambda: list(base_documents),
+    )
+    service = services.RAGService("openai", "gpt-4o", "test-key")
+
+    assert service.total_documents == 1
+    assert service.total_chunks == 1
+    assert service.source_names == ["MedlinePlus"]
+
+    service.ingest(b"Additional uploaded guidance.", "extra.txt")
+
+    assert service.total_documents == 2
+    assert {document.metadata["source"] for document in service.pipeline.documents} == {
+        "MedlinePlus",
+        "extra.txt",
+    }
+
+
 def test_dashboard_service_replaces_same_filename_when_reindexed(monkeypatch):
     monkeypatch.setattr(services, "BiomedicalRAGPipeline", FakePipeline)
     service = services.RAGService("openai", "gpt-4o", "test-key")
@@ -101,6 +136,9 @@ def test_dashboard_service_exposes_pipeline_governance_details(monkeypatch):
 
     assert details == {
         "is_grounded": True,
+        "retrieval_grounded": True,
+        "generation_success": True,
+        "validation_passed": False,
         "warnings": ["example warning"],
         "retrieval_time_ms": 12.5,
         "generation_time_ms": 34.0,

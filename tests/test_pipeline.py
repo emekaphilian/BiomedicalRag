@@ -22,8 +22,9 @@ def _generation_response(
     grounded=True,
     evidence=None,
     issues=None,
+    generation=None,
 ):
-    return {
+    response = {
         "final_answer": answer,
         "retrieval": {"grounded": grounded},
         "compression": {"evidence": evidence or []},
@@ -33,6 +34,9 @@ def _generation_response(
             "generation_time_ms": 3.5,
         },
     }
+    if generation is not None:
+        response["generation"] = generation
+    return response
 
 
 def test_pipeline_indexes_and_queries_with_mock_generation(monkeypatch):
@@ -168,3 +172,61 @@ def test_pipeline_does_not_return_generation_that_failed_validation(monkeypatch)
     assert response.warnings == ["Forbidden phrase detected"]
     assert "could not produce an answer" in response.answer.lower()
     assert "You should take" not in response.answer
+
+
+def test_pipeline_reports_provider_failure_without_mislabeling_validation(
+    monkeypatch,
+):
+    pipeline = BiomedicalRAGPipeline({})
+    pipeline.vectorstore = object()
+    provider_error = "Cohere request failed (HTTP 404): model not found"
+    generation_pipeline = _FakeGenerationPipeline(
+        _generation_response(
+            answer=f"Generation failed: {provider_error}",
+            valid=False,
+            grounded=True,
+            issues=[provider_error],
+            generation={
+                "success": False,
+                "answer": f"Generation failed: {provider_error}",
+                "error": provider_error,
+            },
+        )
+    )
+    monkeypatch.setattr(
+        "rag.pipeline._build_generation_pipeline",
+        lambda *args, **kwargs: generation_pipeline,
+    )
+
+    response = pipeline.query("How does Parkinson's disease affect dopamine?")
+
+    assert response.generation_success is False
+    assert response.validation_passed is False
+    assert response.retrieval_grounded is True
+    assert response.is_grounded is False
+    assert "Generation failed: " + provider_error in response.answer
+    assert "could not produce an answer that passed" not in response.answer.lower()
+    assert response.warnings == [provider_error]
+
+
+def test_pipeline_does_not_mark_unvalidated_answer_as_grounded(monkeypatch):
+    pipeline = BiomedicalRAGPipeline({})
+    pipeline.vectorstore = object()
+    generation_pipeline = _FakeGenerationPipeline(
+        _generation_response(
+            answer="Dopamine levels are affected [Evidence 1].",
+            valid=False,
+            grounded=True,
+            issues=["No evidence citations found in answer"],
+        )
+    )
+    monkeypatch.setattr(
+        "rag.pipeline._build_generation_pipeline",
+        lambda *args, **kwargs: generation_pipeline,
+    )
+
+    response = pipeline.query("How does Parkinson's disease affect dopamine?")
+
+    assert response.retrieval_grounded is True
+    assert response.validation_passed is False
+    assert response.is_grounded is False

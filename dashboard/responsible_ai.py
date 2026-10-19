@@ -27,6 +27,27 @@ _REFUSAL = re.compile(
 )
 
 
+def operator_ethical_risk_score(impact: int, likelihood: int) -> dict:
+    """Compute the manually entered impact × likelihood score (1–5 each)."""
+    if (
+        type(impact) is not int
+        or type(likelihood) is not int
+        or impact not in range(1, 6)
+        or likelihood not in range(1, 6)
+    ):
+        raise ValueError("Impact and likelihood ratings must be integers from 1 to 5.")
+    score = impact * likelihood
+    if score >= 16:
+        level = "Critical"
+    elif score >= 10:
+        level = "High"
+    elif score >= 5:
+        level = "Moderate"
+    else:
+        level = "Low"
+    return {"score": score, "level": level}
+
+
 def build_counterfactual_prompts(template: str, groups: Sequence[str]) -> list:
     if "{group}" not in template:
         raise ValueError("The template must contain the {group} placeholder.")
@@ -122,9 +143,12 @@ def _share(flags: Sequence[bool]) -> Optional[float]:
 
 
 def collect_risk_signals(events: Sequence[Mapping], reviews: Sequence[Mapping], fairness_reports: Sequence[Mapping]) -> dict:
-    successful = [event for event in events if event.get("success")]
+    # Governance query outcomes must not treat configuration, evaluation, or
+    # review records as model answers with missing evidence.
+    query_events = [event for event in events if event.get("event") == "query"]
+    successful = [event for event in query_events if event.get("success")]
     faithfulness = [event["audit"]["faithfulness"] for event in successful if event.get("audit") and event["audit"].get("faithfulness") is not None]
-    secured = [event for event in events if event.get("security")]
+    secured = [event for event in successful if event.get("security")]
     safety_scores = [review["ratings"]["safety"] for review in reviews if "safety" in review.get("ratings", {})]
     return {
         "ungrounded": _share([event.get("is_grounded") is False for event in successful]),

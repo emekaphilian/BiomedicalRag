@@ -69,3 +69,11 @@ output/
 *.swp
 *.swo
 *~
+
+# React / Vite frontend
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+!frontend/package.json
+!frontend/package-lock.json
+!frontend/tsconfig.json

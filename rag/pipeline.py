@@ -17,6 +17,9 @@ class RAGResponse:
     warnings: List[str]
     retrieval_time_ms: float
     generation_time_ms: float
+    retrieval_grounded: bool = False
+    generation_success: bool = False
+    validation_passed: bool = False
 
 
 def _build_index(documents):
@@ -112,6 +115,9 @@ class BiomedicalRAGPipeline:
                 warnings=[safety_result.reason],
                 retrieval_time_ms=0.0,
                 generation_time_ms=0.0,
+                retrieval_grounded=False,
+                generation_success=False,
+                validation_passed=False,
             )
 
         generation_config = self.config.get("generator", {})
@@ -143,7 +149,22 @@ class BiomedicalRAGPipeline:
 
         validation = result["validation"]
         warnings = list(validation.get("issues", []))
-        if validation.get("valid"):
+        generation_reported = "generation" in result
+        generation = result.get("generation", {})
+        generation_success = bool(
+            generation.get("success", validation.get("valid", False))
+        )
+
+        if generation_reported and not generation_success:
+            failure_detail = generation.get("error") or generation.get("answer")
+            if not failure_detail:
+                failure_detail = (
+                    "The configured language model did not return an answer."
+                )
+            answer = str(failure_detail)
+            if not answer.lower().startswith("generation failed:"):
+                answer = f"Generation failed: {answer}"
+        elif validation.get("valid"):
             answer = result["final_answer"]
         else:
             answer = (
@@ -171,10 +192,17 @@ class BiomedicalRAGPipeline:
             answer=answer,
             sources=sources,
             confidence=None,
-            is_grounded=bool(result["retrieval"]["grounded"]),
+            is_grounded=bool(
+                result["retrieval"]["grounded"]
+                and generation_success
+                and validation.get("valid")
+            ),
             warnings=warnings,
             retrieval_time_ms=float(timings.get("retrieval_time_ms", 0.0)),
             generation_time_ms=float(timings.get("generation_time_ms", 0.0)),
+            retrieval_grounded=bool(result["retrieval"]["grounded"]),
+            generation_success=generation_success,
+            validation_passed=bool(validation.get("valid")),
         )
 
 
