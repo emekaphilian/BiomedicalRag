@@ -139,8 +139,57 @@ class GroundedGenerationPipeline:
         # Step 5: Post-Generation Validation
         validation_result = self.validator.validate(
             generation_result,
-            compressed_context["evidence_count"]
+            compressed_context["evidence_count"],
         )
+
+        # Step 6: Retry once when grounded evidence exists but citations are missing.
+        # Never manufacture citations or bypass the existing validator.
+        missing_citations = "No evidence citations found in answer"
+        should_retry_for_citations = (
+            not self.use_mock
+            and isinstance(prompt, dict)
+            and compressed_context["evidence_count"] > 0
+            and generation_result.get("success", False)
+            and not validation_result.get("valid", False)
+            and missing_citations in validation_result.get("issues", [])
+        )
+
+        if should_retry_for_citations:
+            retry_prompt = dict(prompt)
+            retry_prompt["system"] = (
+                f"{prompt.get('system', '')}\n\n"
+                "CITATION RECOVERY REQUIREMENTS:\n"
+                "- Answer using only the supplied retrieved evidence.\n"
+                "- Cite every factual sentence using the exact evidence labels "
+                "provided in the evidence text, such as [Evidence 1].\n"
+                "- Never invent evidence labels or citations.\n"
+                "- If the evidence is insufficient, use the required refusal.\n"
+                "- Do not provide personalized medical advice or unsupported claims."
+            )
+            retry_prompt["user"] = (
+                f"{prompt.get('user', '')}\n\n"
+                "Your previous response failed citation validation. "
+                "Produce a corrected answer that satisfies the citation "
+                "requirements above. Use only the original supplied evidence."
+            )
+
+            retry_started = perf_counter()
+            retry_result = self.generator.generate(
+                retry_prompt,
+                max_tokens=self.generator_config.get("max_tokens", 500),
+                temperature=self.generator_config.get("temperature", 0.3),
+            )
+            generation_time_ms += (
+                perf_counter() - retry_started
+            ) * 1000
+
+            retry_validation = self.validator.validate(
+                retry_result,
+                compressed_context["evidence_count"],
+            )
+
+            generation_result = retry_result
+            validation_result = retry_validation
 
         return {
             "query": query,
