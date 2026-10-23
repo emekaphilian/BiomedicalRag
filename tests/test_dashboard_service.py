@@ -22,8 +22,10 @@ class FakePipeline:
         self.documents = list(documents)
         self.chunks = list(documents)
 
-    def query(self, question, top_k, retrieval_mode, use_reranking):
+    def query(self, question, top_k, retrieval_mode, use_reranking, chat_history=None, retrieval_query=None):
         self.queries.append((question, top_k, retrieval_mode, use_reranking))
+        self.chat_history = chat_history or []
+        self.retrieval_query = retrieval_query
         return SimpleNamespace(
             answer="Grounded answer. MEDICAL DISCLAIMER",
             sources=[
@@ -116,7 +118,7 @@ def test_dashboard_service_returns_answer_chunks_and_provenance(monkeypatch):
 
     stream, sources = service.query_stream(
         "What does the guide say?",
-        chat_history=[{"role": "user", "content": "ignored for safety"}],
+        chat_history=[{"query": "What is diabetes?", "answer": "The guide describes diabetes."}],
         top_k=4,
         mode="sparse",
     )
@@ -125,6 +127,9 @@ def test_dashboard_service_returns_answer_chunks_and_provenance(monkeypatch):
     assert sources[0]["text"] == "Evidence excerpt"
     assert service.pipeline.queries == [
         ("What does the guide say?", 4, "sparse", False)
+    ]
+    assert service.pipeline.chat_history == [
+        {"query": "What is diabetes?", "answer": "The guide describes diabetes."}
     ]
 
 
@@ -138,11 +143,29 @@ def test_dashboard_service_exposes_pipeline_governance_details(monkeypatch):
         "is_grounded": True,
         "retrieval_grounded": True,
         "generation_success": True,
+        "answer_abstained": False,
         "validation_passed": False,
         "warnings": ["example warning"],
         "retrieval_time_ms": 12.5,
         "generation_time_ms": 34.0,
     }
+
+
+def test_dashboard_service_resolves_follow_up_retrieval_from_chat_history(monkeypatch):
+    monkeypatch.setattr(services, "BiomedicalRAGPipeline", FakePipeline)
+    service = services.RAGService("cohere", "command-a-plus-05-2026", "test-key")
+
+    service.query_with_details(
+        "What about its symptoms?",
+        chat_history=[{
+            "query": "What is Parkinson's disease?",
+            "answer": "It is a movement disorder.",
+        }],
+    )
+
+    assert service.pipeline.retrieval_query == (
+        "What is Parkinson's disease? What about its symptoms?"
+    )
 
 
 def test_dashboard_service_retrieves_sparse_evidence_without_generation(

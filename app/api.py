@@ -395,6 +395,14 @@ def query(request: QueryRequest):
             raise HTTPException(status_code=400, detail=event["error"])
         stream, sources, details = service.query_with_details(
             question=guard.sanitized,
+            chat_history=[
+                {"query": event["query"], "answer": event["answer"]}
+                for event in session.events
+                if event.get("event") == "query"
+                and event.get("success")
+                and event.get("query")
+                and event.get("answer")
+            ][-6:],
             top_k=request.top_k,
             mode=request.retrieval_mode,
         )
@@ -403,7 +411,13 @@ def query(request: QueryRequest):
         answer = redact_pii(raw_answer)[0]
         safe_sources = _redact_payload(sources)
         source_texts = [str(source.get("text", "")) for source in safe_sources]
-        answer_audit = audit_answer(answer, source_texts)
+        generation_success = bool(details.get("generation_success", True))
+        answer_abstained = bool(details.get("answer_abstained", False))
+        answer_audit = (
+            audit_answer(answer, source_texts)
+            if generation_success and not answer_abstained
+            else None
+        )
     except HTTPException:
         raise
     except (ValueError, RuntimeError) as error:
@@ -420,13 +434,14 @@ def query(request: QueryRequest):
 
     latency_ms = (time.perf_counter() - started) * 1000
     event.update({
-        "success": True,
+        "success": generation_success,
         "answer": answer,
         "sources": [_redact_payload(source.get("source", "Unknown")) for source in safe_sources],
         "source_count": len(safe_sources),
         "is_grounded": details.get("is_grounded"),
         "retrieval_grounded": details.get("retrieval_grounded"),
         "generation_success": details.get("generation_success"),
+        "answer_abstained": details.get("answer_abstained", False),
         "validation_passed": details.get("validation_passed"),
         "warnings": details.get("warnings", []),
         "latency_ms": latency_ms,
@@ -438,6 +453,8 @@ def query(request: QueryRequest):
         "top_k": request.top_k,
         "security": {**event["security"], "pii_exposed_in_answer": pii_count},
     })
+    if not generation_success:
+        event["error"] = "Generation failed. See the returned answer and warnings for provider details."
     session.events.append(event)
     return {
         "event_id": event_id,

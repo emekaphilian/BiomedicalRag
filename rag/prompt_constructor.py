@@ -33,7 +33,7 @@ Sources: [List the evidence item labels used, such as [Evidence 1], [Evidence 2]
 DO NOT provide medical diagnoses, treatment plans, or medical advice.
 Keep answers factual and evidence-grounded."""
 
-    def construct(self, query, compressed_context):
+    def construct(self, query, compressed_context, chat_history=None):
         """
         Construct full prompt for LLM generation.
         
@@ -47,7 +47,23 @@ Keep answers factual and evidence-grounded."""
         evidence_text = compressed_context.get("formatted_text", "")
         evidence_count = compressed_context.get("evidence_count", 0)
 
-        user_prompt = f"""Query: {query}
+        history_block = ""
+        if chat_history:
+            turns = []
+            for turn in chat_history[-6:]:
+                previous_query = str(turn.get("query", "")).strip()[:1000]
+                previous_answer = str(turn.get("answer", "")).strip()[:1500]
+                if previous_query and previous_answer:
+                    turns.append(f"User: {previous_query}\nAssistant: {previous_answer}")
+            if turns:
+                history_block = (
+                    "Prior conversation (use only to resolve follow-up references; "
+                    "all factual claims in the answer must be supported by the current evidence):\n"
+                    + "\n\n".join(turns)
+                    + "\n\n"
+                )
+
+        user_prompt = f"""{history_block}Current question: {query}
 
 {evidence_text}
 

@@ -21,7 +21,8 @@ class FakeService:
         self.source_names = [item[1] for item in self.documents]
         return self.total_chunks
 
-    def query_with_details(self, question, top_k=5, mode="hybrid"):
+    def query_with_details(self, question, chat_history=None, top_k=5, mode="hybrid"):
+        self.chat_history = chat_history or []
         return iter(["Evidence supports ", "a grounded answer."]), [
             {"source": "guide.txt", "text": "Evidence supports a grounded answer."}
         ], {
@@ -146,6 +147,54 @@ def test_query_redacts_pii_from_returned_evidence(client):
     })
     assert response.status_code == 200
     assert "[REDACTED:EMAIL]" in response.json()["sources"][0]["text"]
+
+
+def test_query_passes_previous_successful_turns_to_the_generator(client):
+    session_id = configured_session(client)
+    client.post("/api/query", json={
+        "session_id": session_id,
+        "question": "What does the guide say?",
+    })
+
+    second = client.post("/api/query", json={
+        "session_id": session_id,
+        "question": "Can you summarize that?",
+    })
+
+    assert second.status_code == 200
+    assert api._sessions[session_id].service.chat_history == [{
+        "query": "What does the guide say?",
+        "answer": "Evidence supports a grounded answer.",
+    }]
+
+
+def test_generation_failure_is_not_a_successful_or_audited_answer(client):
+    session_id = configured_session(client)
+    api._sessions[session_id].service.query_with_details = lambda **kwargs: (
+        iter(["Generation failed: Cohere returned no text."]),
+        [{"source": "guide.txt", "text": "Evidence supports a grounded answer."}],
+        {
+            "is_grounded": False,
+            "generation_success": False,
+            "validation_passed": False,
+            "warnings": ["Cohere returned no text."],
+        },
+    )
+
+    response = client.post("/api/query", json={
+        "session_id": session_id,
+        "question": "What does the guide say?",
+    })
+    assert response.status_code == 200
+    assert response.json()["audit"] is None
+
+    state = client.get(f"/api/sessions/{session_id}").json()
+    event = state["events"][-1]
+    assert event["success"] is False
+    assert event["audit"] is None
+    assert state["summary"]["successful_queries"] == 0
+    assert state["summary"]["failed_queries"] == 1
+    assert state["summary"]["answer_audits"]["answers_audited"] == 0
 
 
 def test_document_upload_validates_and_records_lineage(client):

@@ -38,7 +38,7 @@ def test_cohere_provider_receives_grounded_system_and_evidence_prompts(monkeypat
         SimpleNamespace(ClientV2=FakeClient),
     )
     generator = GroundedGenerator(
-        model_name="command-r-plus",
+        model_name="command-a-plus-05-2026",
         api_key="secret",
         provider="cohere",
     )
@@ -54,11 +54,12 @@ def test_cohere_provider_receives_grounded_system_and_evidence_prompts(monkeypat
 
     assert result["success"] is True
     assert result["answer"] == "Answer [Evidence 1]."
-    assert calls[0]["model"] == "command-r-plus"
+    assert calls[0]["model"] == "command-a-plus-05-2026"
     assert calls[0]["messages"] == [
         {"role": "system", "content": "Use only retrieved evidence."},
         {"role": "user", "content": "Evidence: clinical text"},
     ]
+    assert calls[0]["thinking"] == {"type": "disabled"}
 
 
 def test_cohere_provider_extracts_text_content_returned_as_string(monkeypatch):
@@ -98,6 +99,14 @@ def test_cohere_provider_extracts_text_content_returned_as_string(monkeypatch):
     assert result["answer"] == "Answer returned as plain text [Evidence 1]."
 
 
+def test_cohere_response_parser_handles_json_blocks_and_gateway_text_fields():
+    assert GroundedGenerator._cohere_response_text({
+        "message": {"content": [{"type": "text", "text": "JSON block answer."}]},
+        "finish_reason": "COMPLETE",
+    }) == "JSON block answer."
+    assert GroundedGenerator._cohere_response_text({"text": "Gateway answer."}) == "Gateway answer."
+
+
 def test_cohere_provider_rejects_response_without_text_content(monkeypatch):
     class FakeClient:
         def __init__(self, api_key):
@@ -106,7 +115,9 @@ def test_cohere_provider_rejects_response_without_text_content(monkeypatch):
         def chat(self, **kwargs):
             del kwargs
             return SimpleNamespace(
-                message=SimpleNamespace(content=None)
+                content=None,
+                finish_reason="TOOL_CALL",
+                message=SimpleNamespace(content=None),
             )
 
     monkeypatch.setitem(
@@ -131,6 +142,7 @@ def test_cohere_provider_rejects_response_without_text_content(monkeypatch):
 
     assert result["success"] is False
     assert "did not contain text content" in result["error"]
+    assert "finish_reason=TOOL_CALL" in result["error"]
 
 
 def test_provider_error_reports_status_and_message_without_headers(monkeypatch):

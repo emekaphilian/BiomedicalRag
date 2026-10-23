@@ -5,6 +5,8 @@ from typing import Optional, List, Dict
 
 import cohere
 
+from rag.generator import GroundedGenerator
+
 
 class CohereGenerator:
     """Generate grounded biomedical answers using Cohere API"""
@@ -85,8 +87,7 @@ Instructions:
                 ],
             )
 
-            # Cohere v2 response extraction
-            answer = response.message.content[0].text
+            answer = GroundedGenerator._cohere_response_text(response)
 
             return answer.strip()
 
@@ -187,7 +188,7 @@ Answer ONLY from the provided evidence.
                 ],
             )
 
-            answer = response.message.content[0].text
+            answer = GroundedGenerator._cohere_response_text(response)
 
             # Simulated token streaming
             for token in answer.split():
@@ -270,7 +271,7 @@ class EnhancedCohereGenerator:
                     {"role": "user", "content": user_prompt},
                 ],
             )
-            answer = response.message.content[0].text
+            answer = GroundedGenerator._cohere_response_text(response)
             return answer.strip()
 
         except Exception as e:

@@ -10,6 +10,7 @@ from rag.reranking_retriever import RerankingRetriever
 from rag.compression import ContextCompressor
 from rag.prompt_constructor import GroundedPromptConstructor
 from rag.generator import GroundedGenerator
+from rag.grounding import has_topic_overlap
 from rag.post_validation import PostGenerationValidator
 
 
@@ -56,7 +57,15 @@ class GroundedGenerationPipeline:
         self.validator = PostGenerationValidator()
         self.use_mock = use_mock
 
-    def generate(self, query, k=3, retrieval_k=20, retrieval_mode="hybrid"):
+    def generate(
+        self,
+        query,
+        k=3,
+        retrieval_k=20,
+        retrieval_mode="hybrid",
+        chat_history=None,
+        retrieval_query=None,
+    ):
         """
         Generate grounded answer end-to-end.
         
@@ -69,15 +78,16 @@ class GroundedGenerationPipeline:
             Dictionary with full pipeline results
         """
         retrieval_started = perf_counter()
+        search_query = retrieval_query or query
         if self.use_reranking:
             retrieval_result = self.retriever.retrieve(
-                query,
+                search_query,
                 k=k,
                 retrieval_k=retrieval_k,
             )
             ranked_results = retrieval_result["reranked_results"]
         else:
-            hybrid_result = self.retriever.retrieve(query, k=retrieval_k)
+            hybrid_result = self.retriever.retrieve(search_query, k=retrieval_k)
             metadata_by_content = {}
             for document in self.documents:
                 metadata_by_content.setdefault(
@@ -116,13 +126,56 @@ class GroundedGenerationPipeline:
             }
         retrieval_time_ms = (perf_counter() - retrieval_started) * 1000
 
+        if not ranked_results or not has_topic_overlap(
+            search_query,
+            [item.get("content", "") for item in ranked_results],
+        ):
+            refusal = (
+                "I could not find enough topic-matched evidence in the indexed "
+                "collection to answer this question reliably. Try another query "
+                "or add a source that directly covers the topic."
+            )
+            return {
+                "query": query,
+                "retrieval": {
+                    "fused_count": len(retrieval_result.get("fused_results", [])),
+                    "reranked_count": 0,
+                    "grounded": False,
+                },
+                "compression": {
+                    "compressed_count": 0,
+                    "sources": [],
+                    "evidence": [],
+                    "formatted": "No topic-matched evidence.",
+                },
+                "generation": {
+                    "answer": refusal,
+                    "model": self.generator.model_name,
+                    "success": True,
+                },
+                "validation": {
+                    "valid": True,
+                    "issues": ["No retrieved passages matched the query's specific topic terms."],
+                },
+                "timings": {
+                    "retrieval_time_ms": retrieval_time_ms,
+                    "generation_time_ms": 0.0,
+                },
+                "final_answer": refusal,
+                "answer_abstained": True,
+            }
+
         # Step 2: Context Compression
         compressed_context = self.compressor.compress(
             ranked_results
         )
 
         # Step 3: Prompt Construction
-        prompt = self.prompt_constructor.construct(query, compressed_context)
+        prompt = (
+            self.prompt_constructor.construct(query, compressed_context, chat_history)
+            if chat_history
+            else self.prompt_constructor.construct(query, compressed_context)
+        )
 
         # Step 4: LLM Generation
         generation_started = perf_counter()
@@ -135,6 +188,47 @@ class GroundedGenerationPipeline:
                 temperature=self.generator_config.get("temperature", 0.3),
             )
         generation_time_ms = (perf_counter() - generation_started) * 1000
+
+        # Citation validation alone does not ensure the model answered the
+        # current question. A provider can return stale or off-topic content
+        # while citing valid evidence, so suppress it before it reaches users.
+        if generation_result.get("success") and not has_topic_overlap(
+            query, [generation_result.get("answer", "")]
+        ):
+            refusal = (
+                "I could not produce an answer that addresses the question using "
+                "topic-matched evidence. Please try again or add a directly "
+                "relevant source."
+            )
+            return {
+                "query": query,
+                "retrieval": {
+                    "fused_count": len(retrieval_result.get("fused_results", [])),
+                    "reranked_count": len(ranked_results),
+                    "grounded": False,
+                },
+                "compression": {
+                    "compressed_count": 0,
+                    "sources": [],
+                    "evidence": [],
+                    "formatted": "Generated answer did not match the question topic.",
+                },
+                "generation": {
+                    "answer": refusal,
+                    "model": self.generator.model_name,
+                    "success": True,
+                },
+                "validation": {
+                    "valid": True,
+                    "issues": ["Generated answer did not match the question topic."],
+                },
+                "timings": {
+                    "retrieval_time_ms": retrieval_time_ms,
+                    "generation_time_ms": generation_time_ms,
+                },
+                "final_answer": refusal,
+                "answer_abstained": True,
+            }
 
         # Step 5: Post-Generation Validation
         validation_result = self.validator.validate(

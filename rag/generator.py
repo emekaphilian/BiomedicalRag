@@ -85,15 +85,20 @@ class GroundedGenerator:
                 )
                 answer = response.choices[0].message.content
             elif self.provider == "cohere":
-                response = client.chat(
-                    model=self.model_name,
-                    messages=[
+                cohere_request = {
+                    "model": self.model_name,
+                    "messages": [
                         {"role": "system", "content": prompt_dict["system"]},
                         {"role": "user", "content": prompt_dict["user"]},
                     ],
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                )
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                }
+                if self.model_name.lower().startswith(("command-a-plus", "command-a-reasoning")):
+                    # Command A+ enables reasoning by default. With a small
+                    # output cap, it can spend the entire budget thinking.
+                    cohere_request["thinking"] = {"type": "disabled"}
+                response = client.chat(**cohere_request)
                 answer = self._cohere_response_text(response)
             else:
                 answer = client.text_generation(
@@ -180,28 +185,52 @@ class GroundedGenerator:
 
     @staticmethod
     def _cohere_response_text(response):
-        """Extract generated text from either Cohere v2 content representation."""
-        message = getattr(response, "message", None)
-        content = getattr(message, "content", None)
+        """Extract text from Cohere v2 SDK objects and JSON-shaped responses."""
+        def field(value, name):
+            if isinstance(value, dict):
+                return value.get(name)
+            return getattr(value, name, None)
+
+        message = field(response, "message")
+        content = field(message, "content")
 
         if isinstance(content, str):
-            return content
+            if content.strip():
+                return content
 
+        if isinstance(content, dict):
+            content = [content]
         if isinstance(content, (list, tuple)):
             text_parts = []
             for block in content:
                 if isinstance(block, str):
                     text = block
-                elif isinstance(block, dict):
-                    text = block.get("text")
                 else:
-                    text = getattr(block, "text", None)
-                if isinstance(text, str):
+                    text = field(block, "text")
+                if isinstance(text, str) and text.strip():
                     text_parts.append(text)
             if text_parts:
                 return "".join(text_parts)
 
-        raise ValueError("Cohere response did not contain text content.")
+        # Some compatible Cohere gateways return a top-level text field.
+        text = field(response, "text") or field(message, "text")
+        if isinstance(text, str) and text.strip():
+            return text
+
+        finish_reason = field(response, "finish_reason") or field(message, "finish_reason")
+        blocks = content if isinstance(content, (list, tuple)) else []
+        content_types = sorted({
+            str(field(block, "type"))
+            for block in blocks
+            if field(block, "type") is not None
+        })
+        details = []
+        if finish_reason:
+            details.append(f"finish_reason={finish_reason}")
+        if content_types:
+            details.append(f"content_types={','.join(content_types)}")
+        suffix = f" ({'; '.join(details)})" if details else ""
+        raise ValueError(f"Cohere response did not contain text content{suffix}.")
 
     def generate_mock(self, prompt_dict):
         """

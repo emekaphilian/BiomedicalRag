@@ -15,7 +15,7 @@ type QueryResult = {
   event_id: string;
   answer: string;
   sources: EvidenceSource[];
-  details: { is_grounded?: boolean; warnings?: string[]; validation_passed?: boolean };
+  details: { is_grounded?: boolean; generation_success?: boolean; answer_abstained?: boolean; warnings?: string[]; validation_passed?: boolean };
   latency_ms: number;
 };
 
@@ -51,6 +51,7 @@ export default function App() {
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState<QueryResult | null>(null);
   const [retrieved, setRetrieved] = useState<EvidenceSource[]>([]);
+  const [retrievalAttempted, setRetrievalAttempted] = useState(false);
   const [relevantSources, setRelevantSources] = useState("");
   const [auditAnswerText, setAuditAnswerText] = useState("");
   const [auditEvidence, setAuditEvidence] = useState("");
@@ -166,6 +167,7 @@ export default function App() {
       }),
       (result) => {
         setAnswer(result);
+        setRetrievalAttempted(true);
         setQuestion("");
       },
     );
@@ -180,7 +182,11 @@ export default function App() {
         top_k: topK,
         retrieval_mode: mode,
       }),
-      (result) => setRetrieved(result.sources),
+      (result) => {
+        setRetrieved(result.sources);
+        setAnswer(null);
+        setRetrievalAttempted(true);
+      },
     );
   }
 
@@ -287,6 +293,10 @@ export default function App() {
   const successfulEvents = (dashboard?.events ?? []).filter(
     (event) => event.event === "query" && event.success,
   );
+  const previousTurns = (dashboard?.events ?? [])
+    .filter((event) => event.event === "query" && event.id !== answer?.event_id && (event.query || event.answer))
+    .slice(-12)
+    .reverse();
 
   return (
     <div className="app-shell">
@@ -370,13 +380,14 @@ export default function App() {
               <textarea id="question" value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="How does Parkinson's disease affect dopamine?" rows={4} />
               <div className="button-row"><button className="button primary" onClick={submitQuery} disabled={busy || !dashboard?.configured || !question.trim()}>Ask with RAG</button><button className="button" onClick={retrieveEvidence} disabled={busy || !dashboard?.configured || !question.trim()}>Retrieve evidence</button></div>
               {!dashboard?.configured && <p className="help-text">Connect a model above before querying.</p>}
-              {answer && <div className="answer-card"><div className="answer-status">{answer.details.is_grounded ? "EVIDENCE GROUNDED" : "GROUNDING NOT CONFIRMED"}<span>{(answer.latency_ms / 1000).toFixed(1)} s</span></div><p>{answer.answer}</p>
+              {!!previousTurns.length && <div className="chat-history" aria-label="Previous conversation turns"><div className="history-heading">Previous questions in this session</div>{previousTurns.map((turn) => <article className="history-turn" key={turn.id}><p><strong>You</strong>{turn.query}</p><p><strong>{turn.success ? "BioMed RAG" : "Generation failed"}</strong>{String(turn.answer ?? turn.error ?? "No answer was recorded.")}</p></article>)}</div>}
+              {answer && <div className="answer-card"><div className="answer-status">{answer.details.generation_success === false ? "GENERATION FAILED" : answer.details.answer_abstained ? "NO MATCHING EVIDENCE" : answer.details.is_grounded ? "EVIDENCE GROUNDED" : "GROUNDING NOT CONFIRMED"}<span>{(answer.latency_ms / 1000).toFixed(1)} s</span></div><p>{answer.answer}</p>
                 {!!answer.details.warnings?.length && <div className="alert warning">{answer.details.warnings.join("; ")}</div>}
-                <button className="text-button" onClick={() => { setAuditAnswerText(answer.answer); setAuditEvidence(answer.sources.map((source) => (source.text ?? "").replace(/\s+/g, " ").trim()).join("\n")); setTab("Evaluation"); }}>Audit this answer →</button>
+                {answer.details.generation_success !== false && !answer.details.answer_abstained && <button className="text-button" onClick={() => { setAuditAnswerText(answer.answer); setAuditEvidence(answer.sources.map((source) => (source.text ?? "").replace(/\s+/g, " ").trim()).join("\n")); setTab("Evaluation"); }}>Audit this answer →</button>}
               </div>}
             </div>
             <div className="panel"><div className="panel-heading"><h3>Retrieved evidence</h3><span>{answer?.sources.length ?? retrieved.length} sources</span></div>
-              <EvidenceList sources={answer?.sources ?? retrieved} />
+              <EvidenceList sources={answer?.sources ?? retrieved} emptyMessage={retrievalAttempted ? "No topic-matched passages were found. Try a more specific query or add a directly relevant source." : undefined} />
             </div>
           </div>
           <div className="panel review-panel"><div className="panel-heading"><h3>Human answer review</h3><span>1 = low · 5 = high</span></div>
@@ -470,8 +481,8 @@ export default function App() {
   );
 }
 
-function EvidenceList({ sources }: { sources: EvidenceSource[] }) {
-  if (!sources.length) return <p className="empty">Evidence will appear after retrieval.</p>;
+function EvidenceList({ sources, emptyMessage }: { sources: EvidenceSource[]; emptyMessage?: string }) {
+  if (!sources.length) return <p className="empty">{emptyMessage ?? "Evidence will appear after retrieval."}</p>;
   return <div className="evidence-list">{sources.map((source, index) => <article className="evidence-item" key={`${source.source ?? "source"}-${index}`}>
     <div><span className="source-rank">#{source.rank ?? index + 1}</span><strong>{source.source ?? "Biomedical source"}</strong>{source.score != null && <span className="source-score">{source.score.toFixed(3)}</span>}</div>
     <p>{source.text ?? "No source excerpt provided."}</p>

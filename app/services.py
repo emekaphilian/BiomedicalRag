@@ -7,12 +7,18 @@ from typing import Iterator, List, Optional, Tuple
 
 from rag.document import BiomedicalDocument
 from rag.pipeline import BiomedicalRAGPipeline
+from rag.grounding import has_topic_overlap
+from app.ragguard_observation import RAGGuardObserver
 
 BASE_CORPUS_DIR = (
     Path(__file__).resolve().parents[1]
     / "data"
     / "processed"
     / "downloaded_sources"
+)
+_FOLLOW_UP_REFERENCE = re.compile(
+    r"\b(?:it|its|they|them|their|this|that|these|those|what about|how about|how so)\b",
+    re.IGNORECASE,
 )
 
 
@@ -38,6 +44,8 @@ class RAGService:
 
         self.provider = provider
         self.model = model
+        # Optional telemetry; missing configuration leaves BiomedicalRag unchanged.
+        self.ragguard_observer = RAGGuardObserver.from_environment()
         self._documents = load_default_corpus()
         self.pipeline = BiomedicalRAGPipeline(
             {
@@ -151,16 +159,20 @@ class RAGService:
         mode: str = "hybrid",
     ) -> Tuple[Iterator[str], list, dict]:
         """Return answer chunks, provenance, and checked pipeline details."""
-        del chat_history  # Conversation history is not sent into the medical prompt.
         if mode not in {"hybrid", "dense", "sparse"}:
             raise ValueError(f"Unsupported retrieval mode: {mode}")
 
-        response = self.pipeline.query(
-            question,
-            top_k=top_k,
-            retrieval_mode=mode,
-            use_reranking=False,
-        )
+        query_options = {
+            "top_k": top_k,
+            "retrieval_mode": mode,
+            "use_reranking": False,
+        }
+        if chat_history:
+            query_options["chat_history"] = chat_history[-6:]
+            previous_query = str(chat_history[-1].get("query", "")).strip()
+            if previous_query and _FOLLOW_UP_REFERENCE.search(question):
+                query_options["retrieval_query"] = f"{previous_query} {question}"
+        response = self.pipeline.query(question, **query_options)
         sources = [dict(source) for source in response.sources]
         chunks = re.findall(r"\S+\s*", response.answer)
         details = {
@@ -171,6 +183,7 @@ class RAGService:
             "generation_success": bool(
                 getattr(response, "generation_success", True)
             ),
+            "answer_abstained": bool(getattr(response, "answer_abstained", False)),
             "validation_passed": bool(
                 getattr(response, "validation_passed", not getattr(response, "warnings", []))
             ),
@@ -182,6 +195,32 @@ class RAGService:
                 getattr(response, "generation_time_ms", 0.0)
             ),
         }
+
+        # Report after the pipeline completes. The observer receives only
+        # identifiers/scores and operational status, never answer/source text.
+        observer = self.ragguard_observer
+        if observer is not None:
+            chunk_scores = []
+            for source in sources:
+                chunk_id = source.get("chunk_id") or source.get("id") or source.get("document_id")
+                score = source.get("rerank_score", source.get("score"))
+                if chunk_id is not None and score is not None:
+                    try:
+                        chunk_scores.append((str(chunk_id), float(score)))
+                    except (TypeError, ValueError):
+                        continue
+            try:
+                observer.observe(
+                    query=question,
+                    retrieved_chunks=chunk_scores,
+                    retrieval_method=mode,
+                    retrieval_latency_ms=details["retrieval_time_ms"],
+                    generation_status=("succeeded" if details["generation_success"] else "failed"),
+                )
+            except Exception:
+                # Monitoring must never change the user's RAG answer or UI result.
+                pass
+
         return iter(chunks), sources, details
 
     def retrieve(
@@ -256,6 +295,10 @@ class RAGService:
                 for result in response
             ]
 
+        candidates = [
+            item for item in candidates
+            if has_topic_overlap(safety_result.query, [item[0]])
+        ]
         return [
             {
                 "content": content,

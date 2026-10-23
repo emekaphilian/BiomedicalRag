@@ -20,6 +20,7 @@ class RAGResponse:
     retrieval_grounded: bool = False
     generation_success: bool = False
     validation_passed: bool = False
+    answer_abstained: bool = False
 
 
 def _build_index(documents):
@@ -89,6 +90,8 @@ class BiomedicalRAGPipeline:
         top_k: int = 5,
         use_reranking: bool = True,
         retrieval_mode: str = "hybrid",
+        chat_history: Optional[list] = None,
+        retrieval_query: Optional[str] = None,
     ) -> RAGResponse:
         """Retrieve evidence and generate a safety-checked grounded answer."""
         if self.vectorstore is None:
@@ -145,6 +148,10 @@ class BiomedicalRAGPipeline:
         }
         if retrieval_mode != "hybrid":
             generate_kwargs["retrieval_mode"] = retrieval_mode
+        if chat_history:
+            generate_kwargs["chat_history"] = chat_history[-6:]
+        if retrieval_query:
+            generate_kwargs["retrieval_query"] = retrieval_query
         result = generation_pipeline.generate(safety_result.query, **generate_kwargs)
 
         validation = result["validation"]
@@ -203,6 +210,7 @@ class BiomedicalRAGPipeline:
             retrieval_grounded=bool(result["retrieval"]["grounded"]),
             generation_success=generation_success,
             validation_passed=bool(validation.get("valid")),
+            answer_abstained=bool(result.get("answer_abstained", False)),
         )
 
 
