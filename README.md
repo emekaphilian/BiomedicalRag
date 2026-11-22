@@ -30,7 +30,7 @@
 
 ## Overview
 
-This project implements a **domain-specific Medical Question Answering chatbot** using Retrieval-Augmented Generation (RAG). The system retrieves grounded evidence from a curated biomedical corpus before generating answers, dramatically reducing hallucination compared to standard LLM prompting.
+This project implements a **research prototype for biomedical question answering** using Retrieval-Augmented Generation (RAG). Retrieval provides candidate evidence for answer generation; heuristic checks can reject some unsupported or poorly cited output. They do not establish medical accuracy or clinical safety.
 
 **Research context:** MSc dissertation project — University of Aveiro | ACM Student Project Conference 2026
 
@@ -42,7 +42,7 @@ This project implements a **domain-specific Medical Question Answering chatbot**
 | Reranking | None | **Cross-encoder (ms-marco-MiniLM)** |
 | Safety | None | **Refusal logic + confidence thresholds** |
 | Query handling | One-size-fits-all | **Query classification (factoid / multi-hop / adversarial)** |
-| Evaluation | Informal | **18-query grounding suite + formal metrics** |
+| Evaluation | Evolving | **PubMedQA labeled adapter + expanded adversarial cases** |
 | Corpus | Generic | **32,814 MedQuAD biomedical QA pairs** |
 
 ---
@@ -169,10 +169,10 @@ Biomedical-RAG/
 │   ├── reranker.py         ← Cross-encoder reranking
 │   └── pipeline.py         ← End-to-end RAG pipeline
 ├── evaluation/
-│   ├── grounding_eval.py   ← 18-query grounding suite
+│   ├── PubMedQA adapter    ← labeled biomedical test split
 │   └── metrics.py          ← Recall@K, Precision@K, MRR
 ├── configs/
-│   └── config.yaml         ← System configuration
+│   └── config.yaml         ← Legacy configuration (not loaded by FastAPI)
 ├── data/                   ← MedQuAD processed corpus (not committed)
 ├── .streamlit/
 │   └── secrets.toml        ← API keys (gitignored)
@@ -194,7 +194,7 @@ Biomedical-RAG/
 
 **Overall: ~65–70% complete**
 
-### Phase 3 grounding evaluation results (18-query suite)
+### Historical Phase 3 grounding results (18-query suite)
 
 | Category | Pass Rate | Notes |
 |---|---|---|
@@ -221,6 +221,7 @@ credentials only on the API server; they are never sent to the browser.
 # Install Python dependencies in your active Python 3.11 environment
 pip install -r requirements.txt
 $env:COHERE_API_KEY = "your-key"
+$env:BIOMEDRAG_API_TOKENS = '{"researcher":"replace-with-a-unique-random-token-of-at-least-32-characters"}'
 uvicorn app.main:app --reload
 ```
 
@@ -235,6 +236,65 @@ npm run dev
 Open `http://localhost:5173`. Set `VITE_API_URL` at frontend build/dev time if the
 API is not at `http://127.0.0.1:8000`; configure `BIOMEDRAG_CORS_ORIGINS` on the
 API server with a comma-separated allowlist when using another frontend origin.
+`BIOMEDRAG_API_TOKENS` must be a JSON object mapping principal IDs to unique,
+random bearer tokens of at least 32 ASCII characters. A principal may temporarily
+have an array of old and new tokens during rotation; both still map to the same
+principal. The standalone browser app uses loopback-only local access by default,
+so it does not ask you for an API bearer token. Non-local API clients still need
+one of the configured bearer tokens. Set `BIOMEDRAG_LOCAL_STANDALONE_ACCESS=false`
+to require bearer authentication for local browser access too. RAGGuard
+observation and repair use separate server-side credentials; do not put those
+integration credentials in the browser.
+The health endpoint is public; other `/api` endpoints require a bearer token
+except for the restricted local standalone browser path described above.
+Provider credentials remain server-side, and configuration requests cannot
+override them. The local standalone exception is restricted to loopback clients
+and loopback browser origins; it does not grant access to remote clients.
+
+Generate API tokens with a cryptographically secure generator, for example
+`python -c "import secrets; print(secrets.token_urlsafe(32))"`. Store tokens in
+the API host's secret manager or environment, never in source control. To rotate
+one user's API token without an authentication outage, first deploy both tokens
+for that principal, have the user enter the new token, then remove the old token
+from the secret and redeploy. Token values must remain unique across principals.
+During the overlap, the JSON value for that principal is an array:
+
+```json
+{"researcher":["old-api-token-replace-with-32-plus-chars","new-api-token-replace-with-32-plus-chars"]}
+```
+
+Session metadata, query/audit events, evaluations, reviews, and governance records
+are persisted in SQLite at `data/biomedrag_state.sqlite3` by default. Override
+the path with `BIOMEDRAG_STATE_DB`. The active RAG service, uploaded document
+contents/index, and request-scoped repair contexts remain process-local. After
+an API restart, restored sessions require provider reconfiguration and uploaded
+documents must be uploaded again. Run one API worker until those runtime objects
+and cross-worker writes have shared storage. The default CORS origin is
+`http://localhost:5173`.
+If Vite runs on another port, add its exact origin to
+`BIOMEDRAG_CORS_ORIGINS` (for example, `http://127.0.0.1:5174`).
+
+The API limits each principal to 60 requests per minute and 10 generation or
+fairness requests per minute by default. Override these with
+`BIOMEDRAG_RATE_LIMIT_PER_MINUTE` and
+`BIOMEDRAG_QUERY_RATE_LIMIT_PER_MINUTE`. These limits are process-local; for
+multi-worker or multi-instance deployments, also enforce shared rate limits at
+the gateway or load balancer. Failed API authentication attempts are limited to
+20 per client IP per minute, and internal RAGGuard repair requests to 60 per
+client IP per minute. Session ownership is tied to the configured principal,
+not to the session ID.
+
+### Multi-worker storage decision
+
+Do not run multiple API workers against the current in-memory session and
+repair stores. For a multi-worker deployment, use PostgreSQL as the source of
+truth for sessions, audit state, and repair idempotency/context; keep uploaded
+files in durable object storage and rebuild or share the session indexes from
+those files. Use Redis for atomic shared rate-limit counters and any transient
+observation queue. Protect stored biomedical query context with access controls,
+encryption at rest, and short retention. A shared rate limiter by itself is not
+enough: every worker must be able to restore the same session and repair context.
+
 The API exposes `/api/health`, session configuration, document upload, query and
 retrieval, answer/retrieval evaluation, audit export, human review, security scan,
 fairness screening, and operator risk endpoints. Use OpenAI or Hugging Face by
@@ -345,11 +405,63 @@ The app reads API keys from `st.secrets` automatically when deployed. The key na
 | OpenAI | `openai_api_key` |
 | Hugging Face | `huggingface_api_key` |
 
+For optional RAGGuard observation delivery, add these server-side secrets to
+the deployment that runs queries (or set the matching environment variables on
+another host):
+
+| Secret | Purpose |
+|---|---|
+| `RAGGUARD_URL` | RAGGuard service base URL |
+| `RAGGUARD_OBSERVATION_TOKEN` | Server-side bearer credential for observations |
+| `RAGGUARD_APPLICATION_ID` | Source application ID (defaults to `biomedicalrag`) |
+| `RAGGUARD_ENVIRONMENT` | Deployment environment (defaults to `development`) |
+
+Observations are queued in process memory and delivered in the background. Each
+delivery has a four-second budget, up to three attempts for transient failures,
+and a bounded queue of 256; a full queue drops new telemetry. The observer sends
+redacted queries and operational metadata only. Missing configuration, shutdown,
+queue saturation, network errors, and rejected observations do not interrupt RAG
+answers. This queue is best effort and is not durable across process restarts.
+
+Observation and repair are separate capabilities. The observation token only
+authorizes delivery to RAGGuard. The optional `RAGGUARD_REPAIR_TOKEN` belongs on
+the FastAPI deployment that exposes `/internal/ragguard/repairs`; it must be a
+dedicated credential matching the one configured in RAGGuard. Repair runs only
+after that authenticated endpoint is called and never replaces the answer already
+returned to the user. A Streamlit-only deployment can send observations, but it
+does not expose the FastAPI repair endpoint. Keep tokens in deployment secrets;
+do not commit them.
+
+Repair callbacks are accepted for up to five minutes after the query. Context
+contains the original question and recent conversation only while a repair is
+pending; expired entries are cleaned on later access or insertion, with at most
+256 entries per service. Once a result is recorded, that query context is
+cleared. A `promoted` repair result means that a validated candidate scored
+better for that correlated request. It does not alter the answer already
+returned, session settings, or retrieval behavior for future queries. It is a
+request-scoped evaluation, not a persistent retrieval-policy change. Context
+remains tied to the worker that handled the query, so repairs are supported only
+in a single-worker deployment until session and repair state are shared.
+
+API user tokens support a staged overlap rotation as described above. The
+observation and repair credentials are each single configured secrets in this
+integration. Rotate those with a coordinated cutover: update the corresponding
+credential on both services, redeploy, and verify a synthetic observation and
+an authorized repair before resuming automated repair. No live RAGGuard
+credentials should be placed in this repository.
+
 ---
 
 ## Configuration
 
-Edit `configs/config.yaml` to adjust system behaviour:
+The React + FastAPI application is the canonical deployment path. Provider defaults
+and request controls are defined in `app/api.py`; the active `RAGService` pipeline
+settings are defined in `app/services.py` and `rag/pipeline.py`. The legacy
+`configs/config.yaml` is not loaded by that path and should not be treated as an
+effective runtime configuration. Streamlit remains a separate legacy interface.
+
+The following block is a historical example only; changing it does not configure
+the canonical FastAPI service:
 
 ```yaml
 retrieval:
@@ -377,6 +489,21 @@ safety:
 ---
 
 ## Evaluation Framework
+
+`evaluation/pubmedqa_dataset.py` adapts the locally supplied official PubMedQA
+test labels and contexts for biomedical evaluation. The adversarial suite also
+covers personalized dosing, unsafe medication changes, urgent symptoms, false
+cure claims, and prompt injection. The previously reported 18-query results are
+historical and should not be presented as results for these expanded suites.
+The checks in this application are screening signals; PubMedQA task accuracy
+does not establish clinical accuracy or safety.
+
+Each generated response reports separate retrieval relevance, citation-reference,
+lexical claim-support screen, answer-quality, and medical-accuracy states. A
+passing lexical screen is not reported as `CLAIM_SUPPORT_VALIDATED`; that state
+remains `NOT ESTABLISHED`. Medical accuracy is always reported as
+`NOT ESTABLISHED` unless externally assessed through a separate clinical
+validation process.
 
 The evaluation framework lives in `evaluation/` and implements:
 

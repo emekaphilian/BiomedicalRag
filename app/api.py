@@ -3,20 +3,37 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
+import ipaddress
+import json
 import logging
 import os
+import re
+import sqlite3
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
+from pydantic import BaseModel, ConfigDict, Field
 from dotenv import load_dotenv
+from app.ragguard_repair import (
+    RepairCapabilities,
+    RepairRequest,
+    RepairResult,
+    SUPPORTED_REPAIRS,
+    audit_repair,
+    authorize_repair,
+)
+from app.ragguard_observation import get_server_setting
 
 from dashboard.audit_utils import configuration_version, summarize_answer_quality_reviews
 from dashboard.rag_audit import audit_answer, summarize_audits, retrieval_summary
@@ -54,8 +71,10 @@ class SessionResponse(BaseModel):
 
 
 class ConfigureRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     provider: str = "cohere"
-    model: str | None = None
+    model: str | None = Field(default=None, max_length=200)
 
 
 class QueryRequest(BaseModel):
@@ -113,6 +132,7 @@ class FindingRequest(BaseModel):
 @dataclass
 class DashboardSession:
     created_at: str
+    owner_id: str = ""
     provider: str = "cohere"
     model: str = DEFAULT_MODELS["cohere"]
     retrieval_mode: str = "hybrid"
@@ -128,6 +148,54 @@ class DashboardSession:
 
 _sessions: dict[str, DashboardSession] = {}
 _sessions_lock = threading.RLock()
+_STATE_DB = Path(os.getenv(
+    "BIOMEDRAG_STATE_DB",
+    str(PROJECT_ROOT / "data" / "biomedrag_state.sqlite3"),
+))
+
+
+def _init_state_store() -> None:
+    _STATE_DB.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(_STATE_DB) as connection:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS dashboard_sessions "
+            "(session_id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+        )
+        rows = connection.execute("SELECT session_id, payload FROM dashboard_sessions").fetchall()
+    with _sessions_lock:
+        for session_id, payload in rows:
+            try:
+                state = json.loads(payload)
+                _sessions[session_id] = DashboardSession(**state)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                logger.exception("Could not restore dashboard session %s", session_id)
+
+
+def _persist_sessions() -> None:
+    with _sessions_lock:
+        snapshot = list(_sessions.items())
+    with sqlite3.connect(_STATE_DB, timeout=10) as connection:
+        connection.executemany(
+            "INSERT INTO dashboard_sessions(session_id, payload) VALUES(?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET payload=excluded.payload",
+            [(key, json.dumps({
+                "created_at": session.created_at,
+                "owner_id": session.owner_id,
+                "provider": session.provider,
+                "model": session.model,
+                "retrieval_mode": session.retrieval_mode,
+                "top_k": session.top_k,
+                "documents": session.documents,
+                "events": session.events,
+                "evaluation_runs": session.evaluation_runs,
+                "answer_quality_reviews": session.answer_quality_reviews,
+                "fairness_reports": session.fairness_reports,
+                "risk_register": session.risk_register,
+            }, ensure_ascii=False)) for key, session in snapshot],
+        )
+
+
+_init_state_store()
 
 
 def _new_service(provider: str, model: str, api_key: str):
@@ -136,10 +204,23 @@ def _new_service(provider: str, model: str, api_key: str):
     return RAGService(provider=provider, model=model, api_key=api_key)
 
 
-def _session(session_id: str) -> DashboardSession:
+def _session(session_id: str, owner_id: str) -> DashboardSession:
     with _sessions_lock:
         session = _sessions.get(session_id)
     if session is None:
+        try:
+            with sqlite3.connect(_STATE_DB, timeout=10) as connection:
+                row = connection.execute(
+                    "SELECT payload FROM dashboard_sessions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+            if row:
+                session = DashboardSession(**json.loads(row[0]))
+                with _sessions_lock:
+                    _sessions[session_id] = session
+        except (sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+            logger.exception("Could not load dashboard session %s", session_id)
+    if session is None or session.owner_id != owner_id:
         raise HTTPException(status_code=404, detail="Dashboard session not found.")
     return session
 
@@ -186,8 +267,7 @@ def _require_service(session: DashboardSession, *, generation: bool = False):
 def _source_attack_indices(service: Any, question: str, top_k: int, mode: str) -> list[int]:
     evidence = service.retrieve(question, top_k=top_k, mode=mode)
     return scan_sources([
-        str(item.get("text", item.get("content", "")))
-        for item in evidence
+        str(item.get("text", item.get("content", ""))) for item in evidence
     ])
 
 
@@ -198,7 +278,10 @@ app = FastAPI(
 )
 origins = [
     origin.strip()
-    for origin in os.getenv("BIOMEDRAG_CORS_ORIGINS", "http://localhost:5173").split(",")
+    for origin in os.getenv(
+        "BIOMEDRAG_CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174",
+    ).split(",")
     if origin.strip()
 ]
 app.add_middleware(
@@ -206,8 +289,232 @@ app.add_middleware(
     allow_origins=origins,
     allow_credentials=True,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Authorization", "Content-Type"],
 )
+
+_rate_limit_lock = threading.Lock()
+_rate_limit_windows: dict[tuple[str, str], deque[float]] = {}
+_RATE_LIMIT_WINDOW_SECONDS = 60.0
+_DEFAULT_RATE_LIMIT = 60
+_DEFAULT_QUERY_RATE_LIMIT = 10
+_DEFAULT_AUTH_FAILURE_RATE_LIMIT = 20
+_DEFAULT_INTERNAL_RATE_LIMIT = 60
+
+
+def _configured_api_tokens() -> dict[str, tuple[str, ...]]:
+    raw_tokens = os.getenv("BIOMEDRAG_API_TOKENS", "")
+    if not raw_tokens:
+        raise ValueError("BIOMEDRAG_API_TOKENS is not configured.")
+    try:
+        token_map = json.loads(raw_tokens)
+    except json.JSONDecodeError as error:
+        raise ValueError("BIOMEDRAG_API_TOKENS must be a JSON object.") from error
+    if not isinstance(token_map, dict) or not token_map:
+        raise ValueError("BIOMEDRAG_API_TOKENS must be a non-empty JSON object.")
+
+    tokens: dict[str, tuple[str, ...]] = {}
+    seen_tokens: set[str] = set()
+    for principal_id, configured in token_map.items():
+        if (
+            not isinstance(principal_id, str)
+            or re.fullmatch(r"[A-Za-z0-9_.@-]{1,128}", principal_id) is None
+        ):
+            raise ValueError(
+                "Each API principal ID must contain 1-128 letters, digits, underscores, periods, @, or hyphens."
+            )
+        principal_tokens = [configured] if isinstance(configured, str) else configured
+        if (
+            not isinstance(principal_tokens, list)
+            or not principal_tokens
+            or any(
+                not isinstance(token, str)
+                or len(token) < 32
+                or not token.isascii()
+                for token in principal_tokens
+            )
+        ):
+            raise ValueError(
+                "Each principal must have a token or a non-empty list of tokens, each at least 32 ASCII characters."
+            )
+        if len(set(principal_tokens)) != len(principal_tokens):
+            raise ValueError("A principal cannot repeat an API token.")
+        if any(token in seen_tokens for token in principal_tokens):
+            raise ValueError("API tokens must be unique across all principals.")
+        tokens[principal_id] = tuple(principal_tokens)
+        seen_tokens.update(principal_tokens)
+    return tokens
+
+
+def _authenticate_api_request(
+    authorization: str,
+    tokens: dict[str, tuple[str, ...]],
+) -> str | None:
+    scheme, separator, supplied_token = authorization.partition(" ")
+    if (
+        scheme.lower() != "bearer"
+        or not separator
+        or not supplied_token
+        or not supplied_token.isascii()
+    ):
+        return None
+
+    principal_id = None
+    for candidate_id, expected_tokens in tokens.items():
+        for expected_token in expected_tokens:
+            if hmac.compare_digest(supplied_token, expected_token):
+                principal_id = candidate_id
+    return principal_id
+
+
+def _standalone_local_principal(client_host: str, origin: str | None) -> str | None:
+    """Allow the local standalone UI without issuing a browser bearer token."""
+    if os.getenv("BIOMEDRAG_LOCAL_STANDALONE_ACCESS", "true").strip().lower() not in {
+        "1", "true", "yes", "on",
+    }:
+        return None
+    try:
+        if not ipaddress.ip_address(client_host).is_loopback:
+            return None
+    except ValueError:
+        return None
+    if not origin or origin not in origins:
+        return None
+    return "standalone-local"
+
+
+def _rate_limits() -> tuple[int, int]:
+    values = []
+    for name, default in (
+        ("BIOMEDRAG_RATE_LIMIT_PER_MINUTE", _DEFAULT_RATE_LIMIT),
+        ("BIOMEDRAG_QUERY_RATE_LIMIT_PER_MINUTE", _DEFAULT_QUERY_RATE_LIMIT),
+    ):
+        try:
+            limit = int(os.getenv(name, str(default)))
+        except ValueError as error:
+            raise ValueError(f"{name} must be a positive integer.") from error
+        if limit < 1:
+            raise ValueError(f"{name} must be a positive integer.")
+        values.append(limit)
+    return values[0], values[1]
+
+
+def _rate_limit_retry_after(
+    principal_id: str,
+    path: str,
+    now: float,
+    overall_limit: int,
+    query_limit: int,
+) -> int | None:
+    buckets = [((principal_id, "all"), overall_limit)]
+    if path in {"/api/query", "/api/governance/fairness"}:
+        buckets.append(((principal_id, "generation"), query_limit))
+
+    with _rate_limit_lock:
+        active_windows = []
+        for key, limit in buckets:
+            window = _rate_limit_windows.setdefault(key, deque())
+            while window and now - window[0] >= _RATE_LIMIT_WINDOW_SECONDS:
+                window.popleft()
+            if len(window) >= limit:
+                return max(
+                    1,
+                    int(_RATE_LIMIT_WINDOW_SECONDS - (now - window[0]) + 0.999),
+                )
+            active_windows.append(window)
+        for window in active_windows:
+            window.append(now)
+    return None
+
+
+@app.middleware("http")
+async def protect_api(request: Request, call_next):
+    path = request.url.path
+    client_host = request.client.host if request.client is not None else "unknown"
+    if path.startswith("/internal/ragguard/repairs"):
+        retry_after = _rate_limit_retry_after(
+            f"internal:{client_host}",
+            "/internal",
+            time.monotonic(),
+            _DEFAULT_INTERNAL_RATE_LIMIT,
+            _DEFAULT_INTERNAL_RATE_LIMIT,
+        )
+        if retry_after is not None:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "API rate limit exceeded. Retry later."},
+                headers={"Retry-After": str(retry_after)},
+            )
+        return await call_next(request)
+    if (
+        request.method == "OPTIONS"
+        or not path.startswith("/api/")
+        or path == "/api/health"
+    ):
+        return await call_next(request)
+
+    try:
+        overall_limit, query_limit = _rate_limits()
+    except ValueError as error:
+        logger.error("API security configuration error: %s", error)
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "API authentication or rate limiting is not configured correctly."},
+        )
+
+    authorization = request.headers.get("authorization", "")
+    principal_id = None
+    if not authorization:
+        principal_id = _standalone_local_principal(client_host, request.headers.get("origin"))
+    if principal_id is None:
+        try:
+            tokens = _configured_api_tokens()
+        except ValueError as error:
+            logger.error("API security configuration error: %s", error)
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "API authentication is not configured correctly."},
+            )
+        principal_id = _authenticate_api_request(authorization, tokens)
+    if principal_id is None:
+        retry_after = _rate_limit_retry_after(
+            f"unauthenticated:{client_host}",
+            "/api/auth",
+            time.monotonic(),
+            _DEFAULT_AUTH_FAILURE_RATE_LIMIT,
+            _DEFAULT_AUTH_FAILURE_RATE_LIMIT,
+        )
+        if retry_after is not None:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "API authentication rate limit exceeded. Retry later."},
+                headers={"Retry-After": str(retry_after)},
+            )
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "A valid bearer token is required."},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    request.state.principal_id = principal_id
+    retry_after = _rate_limit_retry_after(
+        principal_id,
+        path,
+        time.monotonic(),
+        overall_limit,
+        query_limit,
+    )
+    if retry_after is not None:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "API rate limit exceeded. Retry later."},
+            headers={"Retry-After": str(retry_after)},
+        )
+    response = await call_next(request)
+    try:
+        await run_in_threadpool(_persist_sessions)
+    except Exception:
+        logger.exception("Could not persist dashboard state")
+    return response
 
 
 @app.get("/api/health")
@@ -215,18 +522,119 @@ def health_check():
     return {"status": "ok", "version": app.version}
 
 
+def _require_ragguard_repair_auth(
+    authorization: str | None,
+    *,
+    request_id: str,
+    strategy: str,
+) -> None:
+    if not get_server_setting("RAGGUARD_REPAIR_TOKEN"):
+        audit_repair(
+            request_id=request_id,
+            strategy=strategy,
+            authorized=False,
+            outcome="repair_credential_not_configured",
+            validated=None,
+            context_verified=None,
+        )
+        raise HTTPException(status_code=503, detail="RAGGuard repair adapter is not configured.")
+    if not authorize_repair(authorization):
+        audit_repair(
+            request_id=request_id,
+            strategy=strategy,
+            authorized=False,
+            outcome="authorization_denied",
+            validated=None,
+            context_verified=None,
+        )
+        raise HTTPException(status_code=401, detail="Invalid repair adapter credential.")
+
+
+@app.get(
+    "/internal/ragguard/repairs/capabilities",
+    response_model=RepairCapabilities,
+)
+def ragguard_repair_capabilities(
+    authorization: str | None = Header(default=None),
+):
+    _require_ragguard_repair_auth(
+        authorization,
+        request_id="capability-discovery",
+        strategy="capability_discovery",
+    )
+    return RepairCapabilities(supported_repairs=list(SUPPORTED_REPAIRS))
+
+
+@app.post(
+    "/internal/ragguard/repairs",
+    response_model=RepairResult,
+)
+def ragguard_execute_repair(
+    request: RepairRequest,
+    authorization: str | None = Header(default=None),
+):
+    _require_ragguard_repair_auth(
+        authorization,
+        request_id=request.request_id,
+        strategy=request.strategy,
+    )
+    expected_application = get_server_setting("RAGGUARD_APPLICATION_ID", "biomedicalrag")
+    expected_environment = get_server_setting("RAGGUARD_ENVIRONMENT", "development")
+    if (
+        request.application_id != expected_application
+        or request.environment != expected_environment
+    ):
+        audit_repair(
+            request_id=request.request_id,
+            strategy=request.strategy,
+            authorized=False,
+            outcome="application_identity_mismatch",
+            validated=None,
+            context_verified=None,
+        )
+        raise HTTPException(status_code=403, detail="Repair request application identity mismatch.")
+
+    with _sessions_lock:
+        sessions = list(_sessions.values())
+    for session in sessions:
+        service = session.service
+        if service is None or not hasattr(service, "execute_ragguard_repair"):
+            continue
+        with service._ragguard_pending_lock:
+            is_pending = request.request_id in service._ragguard_pending_repairs
+        if is_pending:
+            return service.execute_ragguard_repair(request)
+
+    audit_repair(
+        request_id=request.request_id,
+        strategy=request.strategy,
+        authorized=True,
+        outcome="request_context_not_found",
+        validated=False,
+        context_verified=False,
+    )
+    raise HTTPException(status_code=409, detail="No active query context exists for this repair request.")
+
+
 @app.post("/api/sessions", response_model=SessionResponse)
-def create_session():
+def create_session(request: Request):
     session_id = str(uuid4())
     created_at = _now()
     with _sessions_lock:
-        _sessions[session_id] = DashboardSession(created_at=created_at)
+        _sessions[session_id] = DashboardSession(
+            created_at=created_at,
+            owner_id=request.state.principal_id,
+        )
     return SessionResponse(session_id=session_id, created_at=created_at)
 
 
 @app.get("/api/sessions/{session_id}")
-def get_session_state(session_id: str):
-    session = _session(session_id)
+def get_session_state(session_id: str, request: Request):
+    session = _session(session_id, request.state.principal_id)
+    return _session_state(session_id, session)
+
+
+def _session_state(session_id: str, session: DashboardSession) -> dict[str, Any]:
     events = [event for event in session.events if event.get("event") == "query"]
     successful = [event for event in events if event.get("success")]
     latencies = [
@@ -264,8 +672,8 @@ def get_session_state(session_id: str):
 
 
 @app.post("/api/sessions/{session_id}/configure")
-def configure_session(session_id: str, request: ConfigureRequest):
-    session = _session(session_id)
+def configure_session(session_id: str, request: ConfigureRequest, http_request: Request):
+    session = _session(session_id, http_request.state.principal_id)
     provider = request.provider.strip().lower()
     if provider not in SUPPORTED_PROVIDERS:
         raise HTTPException(status_code=422, detail="Unsupported LLM provider.")
@@ -298,15 +706,16 @@ def configure_session(session_id: str, request: ConfigureRequest):
         "model": model,
         "configuration": _configuration(session),
     })
-    return get_session_state(session_id)
+    return _session_state(session_id, session)
 
 
 @app.post("/api/documents")
 async def upload_document(
+    request: Request,
     session_id: str = Form(...),
     file: UploadFile = File(...),
 ):
-    session = _session(session_id)
+    session = _session(session_id, request.state.principal_id)
     service = _require_service(session)
     filename = (file.filename or "").replace("\\", "/").split("/")[-1].strip()
     if not filename:
@@ -322,7 +731,7 @@ async def upload_document(
     digest = hashlib.sha256(content).hexdigest()
     started = time.perf_counter()
     try:
-        chunks = service.ingest(content, filename)
+        chunks = await run_in_threadpool(service.ingest, content, filename)
     except (ValueError, UnicodeDecodeError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     record = {
@@ -352,8 +761,8 @@ async def upload_document(
 
 
 @app.post("/api/query")
-def query(request: QueryRequest):
-    session = _session(request.session_id)
+def query(request: QueryRequest, http_request: Request):
+    session = _session(request.session_id, http_request.state.principal_id)
     service = _require_service(session, generation=True)
     if request.retrieval_mode not in {"hybrid", "dense", "sparse"}:
         raise HTTPException(status_code=422, detail="Unsupported retrieval mode.")
@@ -382,17 +791,17 @@ def query(request: QueryRequest):
         session.events.append(event)
         raise HTTPException(status_code=400, detail=event["error"])
     try:
-        blocked_sources = _source_attack_indices(
-            service,
-            guard.sanitized,
-            request.top_k,
-            request.retrieval_mode,
-        )
-        if blocked_sources:
-            event["security"]["source_attack_indices"] = blocked_sources
-            event["error"] = "Potential prompt-injection content was found in retrieved evidence; generation was blocked."
-            session.events.append(event)
-            raise HTTPException(status_code=400, detail=event["error"])
+        # Compatibility for host adapters that do not expose the canonical RAG
+        # pipeline. The built-in RAGService screens the exact prompt evidence.
+        if not hasattr(service, "pipeline") and hasattr(service, "retrieve"):
+            blocked_sources = _source_attack_indices(
+                service, guard.sanitized, request.top_k, request.retrieval_mode,
+            )
+            if blocked_sources:
+                event["security"]["source_attack_indices"] = blocked_sources
+                event["error"] = "Potential prompt-injection content was found in retrieved evidence; generation was blocked."
+                session.events.append(event)
+                raise HTTPException(status_code=400, detail=event["error"])
         stream, sources, details = service.query_with_details(
             question=guard.sanitized,
             chat_history=[
@@ -468,8 +877,8 @@ def query(request: QueryRequest):
 
 
 @app.post("/api/retrieve")
-def retrieve(request: RetrieveRequest):
-    session = _session(request.session_id)
+def retrieve(request: RetrieveRequest, http_request: Request):
+    session = _session(request.session_id, http_request.state.principal_id)
     service = _require_service(session)
     if request.retrieval_mode not in {"hybrid", "dense", "sparse"}:
         raise HTTPException(status_code=422, detail="Unsupported retrieval mode.")
@@ -497,8 +906,8 @@ def retrieve(request: RetrieveRequest):
 
 
 @app.post("/api/evaluation/retrieval")
-def evaluate_retrieval(request: RetrievalEvaluationRequest, session_id: str):
-    session = _session(session_id)
+def evaluate_retrieval(request: RetrievalEvaluationRequest, session_id: str, http_request: Request):
+    session = _session(session_id, http_request.state.principal_id)
     if not any(source.strip() for source in request.retrieved_sources):
         raise HTTPException(status_code=422, detail="Retrieve evidence before evaluating retrieval.")
     if not any(source.strip() for source in request.relevant_sources):
@@ -523,8 +932,8 @@ def evaluate_retrieval(request: RetrievalEvaluationRequest, session_id: str):
 
 
 @app.post("/api/evaluation/answer")
-def evaluate_answer(request: AnswerEvaluationRequest, session_id: str):
-    session = _session(session_id)
+def evaluate_answer(request: AnswerEvaluationRequest, session_id: str, http_request: Request):
+    session = _session(session_id, http_request.state.principal_id)
     safe_answer = redact_pii(request.answer)[0]
     safe_evidence = _redact_payload(request.evidence_texts)
     report = audit_answer(safe_answer, safe_evidence)
@@ -543,8 +952,8 @@ def evaluate_answer(request: AnswerEvaluationRequest, session_id: str):
 
 
 @app.post("/api/reviews")
-def create_review(request: ReviewRequest, session_id: str):
-    session = _session(session_id)
+def create_review(request: ReviewRequest, session_id: str, http_request: Request):
+    session = _session(session_id, http_request.state.principal_id)
     query_event = next(
         (
             event for event in session.events
@@ -572,7 +981,7 @@ def create_review(request: ReviewRequest, session_id: str):
         "timestamp": _now(),
         "query_event_id": request.query_event_id,
         "ratings": request.ratings,
-        "notes": request.notes,
+        "notes": redact_pii(request.notes)[0],
     }
     session.answer_quality_reviews.append(review)
     session.events.append({"event": "answer_review", **review, "success": True})
@@ -595,8 +1004,8 @@ def security_scan(text: str = Form(...)):
 
 
 @app.post("/api/governance/fairness")
-def run_fairness_screen(request: FairnessRequest):
-    session = _session(request.session_id)
+def run_fairness_screen(request: FairnessRequest, http_request: Request):
+    session = _session(request.session_id, http_request.state.principal_id)
     service = _require_service(session, generation=True)
     safe_template = redact_pii(request.template)[0]
     safe_groups = [redact_pii(group)[0] for group in request.groups]
@@ -611,17 +1020,15 @@ def run_fairness_screen(request: FairnessRequest):
         if guard.blocked:
             raise HTTPException(status_code=400, detail="A fairness variant was blocked by the prompt-attack screen.")
         try:
-            blocked_sources = _source_attack_indices(
-                service,
-                guard.sanitized,
-                request.top_k,
-                session.retrieval_mode,
-            )
-            if blocked_sources:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Potential prompt-injection content was found in retrieved evidence; fairness generation was blocked.",
+            if not hasattr(service, "pipeline") and hasattr(service, "retrieve"):
+                blocked_sources = _source_attack_indices(
+                    service, guard.sanitized, request.top_k, session.retrieval_mode,
                 )
+                if blocked_sources:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Potential prompt-injection content was found in retrieved evidence; fairness generation was blocked.",
+                    )
             stream, sources, details = service.query_with_details(
                 question=guard.sanitized,
                 top_k=request.top_k,
@@ -654,14 +1061,14 @@ def run_fairness_screen(request: FairnessRequest):
 
 
 @app.post("/api/governance/risk")
-def record_operator_risk(request: OperatorRiskRequest, session_id: str):
-    session = _session(session_id)
+def record_operator_risk(request: OperatorRiskRequest, session_id: str, http_request: Request):
+    session = _session(session_id, http_request.state.principal_id)
     score = operator_ethical_risk_score(request.impact, request.likelihood)
     record = {
         "id": str(uuid4()),
         "timestamp": _now(),
-        "title": request.title,
-        "rationale": request.rationale,
+        "title": redact_pii(request.title)[0],
+        "rationale": redact_pii(request.rationale)[0],
         "impact": request.impact,
         "likelihood": request.likelihood,
         **score,
@@ -671,20 +1078,24 @@ def record_operator_risk(request: OperatorRiskRequest, session_id: str):
 
 
 @app.post("/api/governance/findings")
-def add_governance_finding(request: FindingRequest, session_id: str):
-    session = _session(session_id)
+def add_governance_finding(request: FindingRequest, session_id: str, http_request: Request):
+    session = _session(session_id, http_request.state.principal_id)
     finding = {
         "id": str(uuid4()),
         "timestamp": _now(),
-        **request.model_dump(),
+        **{
+            **request.model_dump(),
+            "title": redact_pii(request.title)[0],
+            "rationale": redact_pii(request.rationale)[0],
+        },
     }
     session.risk_register.append(finding)
     return finding
 
 
 @app.get("/api/governance/summary")
-def governance_summary(session_id: str):
-    session = _session(session_id)
+def governance_summary(session_id: str, request: Request):
+    session = _session(session_id, request.state.principal_id)
     signals = collect_risk_signals(
         session.events,
         session.answer_quality_reviews,
@@ -700,8 +1111,8 @@ def governance_summary(session_id: str):
 
 
 @app.get("/api/audit/export")
-def export_audit(session_id: str):
-    session = _session(session_id)
+def export_audit(session_id: str, request: Request):
+    session = _session(session_id, request.state.principal_id)
     return {
         "session_only": True,
         "session_id": session_id,

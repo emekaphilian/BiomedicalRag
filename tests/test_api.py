@@ -46,12 +46,23 @@ class FakeService:
 def client(monkeypatch):
     with api._sessions_lock:
         api._sessions.clear()
+    with api._rate_limit_lock:
+        api._rate_limit_windows.clear()
     monkeypatch.setattr(api, "_new_service", FakeService)
     monkeypatch.setenv("COHERE_API_KEY", "test-server-secret")
-    with TestClient(api.app) as test_client:
+    monkeypatch.setenv(
+        "BIOMEDRAG_API_TOKENS",
+        '{"researcher":"' + ("r" * 40) + '","other":"' + ("o" * 40) + '"}',
+    )
+    with TestClient(
+        api.app,
+        headers={"Authorization": "Bearer " + ("r" * 40)},
+    ) as test_client:
         yield test_client
     with api._sessions_lock:
         api._sessions.clear()
+    with api._rate_limit_lock:
+        api._rate_limit_windows.clear()
 
 
 def configured_session(client):
@@ -73,12 +84,177 @@ def test_health_and_session_state_are_available(client):
     assert "api_key" not in str(state)
 
 
+def test_api_authentication_is_required_except_for_health(client):
+    anonymous = TestClient(api.app)
+    assert anonymous.get("/api/health").status_code == 200
+
+    missing = anonymous.post("/api/sessions", json={})
+    invalid = anonymous.post(
+        "/api/sessions",
+        json={},
+        headers={"Authorization": "Bearer invalid-token"},
+    )
+    assert missing.status_code == 401
+    assert missing.headers["www-authenticate"] == "Bearer"
+    assert invalid.status_code == 401
+    assert api._authenticate_api_request(
+        "Bearer " + ("é" * 40),
+        api._configured_api_tokens(),
+    ) is None
+
+
+def test_local_standalone_access_is_loopback_only(monkeypatch):
+    monkeypatch.delenv("BIOMEDRAG_LOCAL_STANDALONE_ACCESS", raising=False)
+
+    assert api._standalone_local_principal(
+        "127.0.0.1", "http://127.0.0.1:5174"
+    ) == "standalone-local"
+    assert api._standalone_local_principal(
+        "::1", "http://localhost:5173"
+    ) == "standalone-local"
+    assert api._standalone_local_principal(
+        "192.0.2.10", "http://localhost:5174"
+    ) is None
+    assert api._standalone_local_principal(
+        "127.0.0.1", "https://remote.example"
+    ) is None
+    assert api._standalone_local_principal("127.0.0.1", None) is None
+
+    monkeypatch.setenv("BIOMEDRAG_LOCAL_STANDALONE_ACCESS", "false")
+    assert api._standalone_local_principal(
+        "127.0.0.1", "http://localhost:5174"
+    ) is None
+
+
+def test_missing_api_token_configuration_fails_closed(client, monkeypatch):
+    monkeypatch.delenv("BIOMEDRAG_API_TOKENS")
+
+    response = client.post("/api/sessions", json={})
+
+    assert response.status_code == 503
+
+
+def test_api_token_rotation_accepts_old_and_new_tokens_for_same_principal(monkeypatch):
+    old_token = "o" * 40
+    new_token = "n" * 40
+    monkeypatch.setenv(
+        "BIOMEDRAG_API_TOKENS",
+        '{"researcher":[' + f'"{old_token}","{new_token}"' + ']}',
+    )
+
+    tokens = api._configured_api_tokens()
+
+    assert tokens["researcher"] == (old_token, new_token)
+    assert api._authenticate_api_request(f"Bearer {old_token}", tokens) == "researcher"
+    assert api._authenticate_api_request(f"Bearer {new_token}", tokens) == "researcher"
+
+
+def test_api_tokens_cannot_be_reused_during_rotation(monkeypatch):
+    shared_token = "s" * 40
+    monkeypatch.setenv(
+        "BIOMEDRAG_API_TOKENS",
+        '{"researcher":["' + shared_token + '"],"operator":"' + shared_token + '"}',
+    )
+
+    with pytest.raises(ValueError, match="unique across all principals"):
+        api._configured_api_tokens()
+
+
+def test_failed_authentication_attempts_are_rate_limited(client):
+    anonymous = TestClient(api.app)
+    responses = [
+        anonymous.post(
+            "/api/sessions",
+            json={},
+            headers={"Authorization": "Bearer invalid-token"},
+        )
+        for _ in range(20)
+    ]
+    limited = anonymous.post(
+        "/api/sessions",
+        json={},
+        headers={"Authorization": "Bearer invalid-token"},
+    )
+
+    assert all(response.status_code == 401 for response in responses)
+    assert limited.status_code == 429
+    assert "retry-after" in limited.headers
+
+
+def test_cors_preflight_allows_authorization_header(client):
+    response = TestClient(api.app).options(
+        "/api/sessions",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "authorization" in response.headers["access-control-allow-headers"].lower()
+
+
+def test_session_ownership_is_enforced_for_other_principals(client):
+    session_id = client.post("/api/sessions", json={}).json()["session_id"]
+    other_user = TestClient(
+        api.app,
+        headers={"Authorization": "Bearer " + ("o" * 40)},
+    )
+
+    state = other_user.get(f"/api/sessions/{session_id}")
+    configure = other_user.post(
+        f"/api/sessions/{session_id}/configure",
+        json={"provider": "cohere"},
+    )
+
+    assert state.status_code == 404
+    assert configure.status_code == 404
+
+
 def test_configuration_keeps_credentials_server_side(client):
     session_id = configured_session(client)
     state = client.get(f"/api/sessions/{session_id}").json()
     assert state["configured"] is True
     assert state["configuration"]["settings"]["provider"] == "cohere"
     assert "test-server-secret" not in str(state)
+    assert api._sessions[session_id].service.api_key == "test-server-secret"
+
+
+def test_provider_keys_cannot_be_supplied_by_api_clients(client):
+    session_id = client.post("/api/sessions", json={}).json()["session_id"]
+    response = client.post(
+        f"/api/sessions/{session_id}/configure",
+        json={
+            "provider": "cohere",
+            "api_key": "client-controlled-secret",
+        },
+    )
+
+    assert response.status_code == 422
+    assert api._sessions[session_id].service is None
+
+
+def test_api_rate_limit_returns_retry_after(client, monkeypatch):
+    monkeypatch.setenv("BIOMEDRAG_RATE_LIMIT_PER_MINUTE", "1")
+    response = client.post("/api/sessions", json={})
+    limited = client.post("/api/sessions", json={})
+
+    assert response.status_code == 200
+    assert limited.status_code == 429
+    assert int(limited.headers["retry-after"]) >= 1
+
+
+def test_query_rate_limit_is_stricter_than_general_api_limit(client, monkeypatch):
+    monkeypatch.setenv("BIOMEDRAG_QUERY_RATE_LIMIT_PER_MINUTE", "1")
+    session_id = configured_session(client)
+    payload = {"session_id": session_id, "question": "What does the guide say?"}
+
+    first = client.post("/api/query", json=payload)
+    second = client.post("/api/query", json=payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 429
 
 
 def test_query_preserves_provenance_audit_and_redacts_pii(client):

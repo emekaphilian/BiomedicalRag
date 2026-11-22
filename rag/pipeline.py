@@ -1,6 +1,7 @@
 """End-to-end biomedical retrieval and grounded-answer pipeline."""
 
 from dataclasses import dataclass
+from threading import RLock
 from typing import Any, Dict, List, Optional, Sequence
 
 from rag.document import BiomedicalDocument
@@ -21,6 +22,7 @@ class RAGResponse:
     generation_success: bool = False
     validation_passed: bool = False
     answer_abstained: bool = False
+    validation_states: Dict[str, Any] | None = None
 
 
 def _build_index(documents):
@@ -56,6 +58,7 @@ class BiomedicalRAGPipeline:
         self.documents: List[BiomedicalDocument] = []
         self.chunks: List[BiomedicalDocument] = []
         self._generation_pipelines = {}
+        self._index_lock = RLock()
 
     def index_documents(
         self,
@@ -79,10 +82,11 @@ class BiomedicalRAGPipeline:
             )
 
         vectorstore, chunks = _build_index(processed_documents)
-        self.vectorstore = vectorstore
-        self.documents = processed_documents
-        self.chunks = chunks
-        self._generation_pipelines.clear()
+        with self._index_lock:
+            self.vectorstore = vectorstore
+            self.documents = processed_documents
+            self.chunks = chunks
+            self._generation_pipelines.clear()
 
     def query(
         self,
@@ -92,8 +96,19 @@ class BiomedicalRAGPipeline:
         retrieval_mode: str = "hybrid",
         chat_history: Optional[list] = None,
         retrieval_query: Optional[str] = None,
+        source_screen=None,
     ) -> RAGResponse:
         """Retrieve evidence and generate a safety-checked grounded answer."""
+        with self._index_lock:
+            return self._query_locked(
+                question, top_k, use_reranking, retrieval_mode,
+                chat_history, retrieval_query, source_screen,
+            )
+
+    def _query_locked(
+        self, question, top_k, use_reranking, retrieval_mode,
+        chat_history, retrieval_query, source_screen,
+    ) -> RAGResponse:
         if self.vectorstore is None:
             raise RuntimeError(
                 "The RAG pipeline has no index. Call index_documents first."
@@ -152,6 +167,8 @@ class BiomedicalRAGPipeline:
             generate_kwargs["chat_history"] = chat_history[-6:]
         if retrieval_query:
             generate_kwargs["retrieval_query"] = retrieval_query
+        if source_screen:
+            generate_kwargs["source_screen"] = source_screen
         result = generation_pipeline.generate(safety_result.query, **generate_kwargs)
 
         validation = result["validation"]
@@ -211,6 +228,15 @@ class BiomedicalRAGPipeline:
             generation_success=generation_success,
             validation_passed=bool(validation.get("valid")),
             answer_abstained=bool(result.get("answer_abstained", False)),
+            validation_states={
+                "RETRIEVAL_RELEVANCE_VALIDATED": bool(result["retrieval"].get("grounded")),
+                "CITATION_REFERENCES_VALIDATED": bool(validation.get("citation_references_validated", False)),
+                "CLAIM_SUPPORT_VALIDATED": "NOT ESTABLISHED",
+                "CLAIM_SUPPORT_SCREEN_PASSED": bool(validation.get("claim_support_screen_passed", False)),
+                "ANSWER_QUALITY_EVALUATED": None,
+                "MEDICAL_ACCURACY_NOT_ESTABLISHED": "NOT ESTABLISHED",
+                "claim_support_method": validation.get("claim_support_method", "not-evaluated"),
+            },
         )
 
 

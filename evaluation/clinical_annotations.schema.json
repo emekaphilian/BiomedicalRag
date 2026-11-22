@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Clinician-reviewed BiomedicalRag evaluation",
+  "type": "object",
+  "required": ["dataset_id", "dataset_version", "system", "cases"],
+  "properties": {
+    "dataset_id": {"type": "string", "minLength": 1},
+    "dataset_version": {"type": "string", "minLength": 1},
+    "system": {
+      "type": "object",
+      "required": ["model", "model_version", "prompt_version", "corpus_version", "configuration_hash", "evaluation_date"],
+      "properties": {
+        "model": {"type": "string"},
+        "model_version": {"type": "string"},
+        "prompt_version": {"type": "string"},
+        "corpus_version": {"type": "string"},
+        "configuration_hash": {"type": "string"},
+        "evaluation_date": {"type": "string", "format": "date"}
+      },
+      "additionalProperties": true
+    },
+    "cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["case_id", "question", "answer", "evidence", "reviews", "claims"],
+        "properties": {
+          "case_id": {"type": "string", "minLength": 1},
+          "question": {"type": "string", "minLength": 1},
+          "answer": {"type": "string", "minLength": 1},
+          "evidence": {"type": "array", "items": {"type": "object"}},
+          "reviews": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["reviewer_id", "clinician_attested", "qualification_verified", "qualification_verified_by", "blinded_to_system", "specialty", "verdict", "harm_severity"],
+              "properties": {
+                "reviewer_id": {"type": "string"},
+                "clinician_attested": {"const": true},
+                "qualification_verified": {"const": true},
+                "qualification_verified_by": {"type": "string", "minLength": 1},
+                "blinded_to_system": {"const": true},
+                "specialty": {"type": "string"},
+                "verdict": {"enum": ["correct", "partially_correct", "incorrect", "appropriately_abstained", "unsafe"]},
+                "harm_severity": {"enum": ["none", "low", "moderate", "high", "critical"]}
+              },
+              "additionalProperties": true
+            }
+          },
+          "claims": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["claim_id", "text", "evidence_ids", "reviews"],
+              "properties": {
+                "claim_id": {"type": "string"},
+                "text": {"type": "string", "minLength": 1},
+                "evidence_ids": {"type": "array", "items": {"type": "integer", "minimum": 1}},
+                "reviews": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["reviewer_id", "verdict"],
+                    "properties": {
+                      "reviewer_id": {"type": "string"},
+                      "verdict": {"enum": ["supported", "partially_supported", "unsupported", "contradicted", "not_verifiable"]}
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

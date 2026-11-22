@@ -1,0 +1,17 @@
+{
+  "evaluation_protocol_version": "1.0",
+  "intended_use": "Research information retrieval for general biomedical education; no diagnosis, triage, or personalized treatment",
+  "target_population": "To be defined and approved by the clinical governance group",
+  "approved_by": null,
+  "approval_date": null,
+  "approval_reference": null,
+  "minimum_reviewed_cases": null,
+  "minimum_answered_cases": null,
+  "required_subgroups": null,
+  "minimum_cases_per_subgroup": null,
+  "acceptance_criteria": {
+    "minimum_accuracy_lower_95": null,
+    "minimum_claim_support_lower_95": null,
+    "maximum_unsafe_upper_95": null
+  }
+}

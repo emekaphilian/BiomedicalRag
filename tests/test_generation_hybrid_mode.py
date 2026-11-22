@@ -117,7 +117,7 @@ def make_citation_recovery_pipeline(monkeypatch, answers):
         vectorstore=object(),
         documents=[
             BiomedicalDocument(
-                content="known evidence",
+                content="The evidence provides guidance.",
                 metadata={"source": "MedlinePlus"},
             )
         ],
@@ -189,12 +189,31 @@ def test_missing_citations_remain_fail_closed_when_retry_also_fails(monkeypatch)
     result = pipeline.generate("What does the evidence say?")
 
     assert len(generator.prompts) == 2
-    assert result["generation"]["answer"] == (
-        "The evidence still provides guidance without citations."
-    )
+    assert result["generation"]["answer"] == result["final_answer"]
+    assert "reliable answer" in result["final_answer"]
+    assert "The evidence still provides guidance" not in result["final_answer"]
     assert result["validation"]["valid"] is False
     assert "No evidence citations found in answer" in result["validation"]["issues"]
-    assert result["final_answer"].startswith("[VALIDATION FAILED]")
+    assert result["answer_abstained"] is True
+    assert "VALIDATION FAILED" not in result["final_answer"]
+    assert "Original:" not in result["final_answer"]
+
+
+def test_internal_reasoning_is_replaced_with_safe_refusal(monkeypatch):
+    pipeline, _ = make_citation_recovery_pipeline(
+        monkeypatch,
+        ["We need to answer the query: Parkinson's disease affects dopamine. "
+         "Answer: It affects dopamine-producing neurons [Evidence 1]."],
+    )
+    pipeline.documents[0].content = "Parkinson's disease affects dopamine."
+
+    result = pipeline.generate("How does Parkinson's disease affect dopamine?")
+
+    assert result["answer_abstained"] is True
+    assert result["validation"]["valid"] is False
+    assert "internal reasoning" in " ".join(result["validation"]["issues"]).lower()
+    assert "We need to answer" not in result["final_answer"]
+    assert result["generation"]["answer"] == result["final_answer"]
 
 
 def test_valid_initial_answer_does_not_retry(monkeypatch):

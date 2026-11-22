@@ -1,7 +1,9 @@
 from types import SimpleNamespace
+from threading import Event
+from uuid import UUID
 
 import app.services as services
-from app.ragguard_observation import RAGGuardObserver
+from app.ragguard_observation import RAGGuardObserver, enqueue_observation
 
 
 class FakePipeline:
@@ -36,9 +38,11 @@ def test_service_sends_minimal_observation_and_preserves_result(monkeypatch):
     monkeypatch.setattr(services, "load_default_corpus", lambda: [])
     monkeypatch.setattr(services, "BiomedicalRAGPipeline", FakePipeline)
     observer = SimpleNamespace(observations=[])
+    delivered = Event()
 
     def observe(**kwargs):
         observer.observations.append(kwargs)
+        delivered.set()
         return SimpleNamespace(delivered=True)
 
     observer.observe = observe
@@ -50,13 +54,16 @@ def test_service_sends_minimal_observation_and_preserves_result(monkeypatch):
     assert "".join(stream) == "Private grounded answer"
     assert sources[0]["text"] == "Private source excerpt"
     assert details["generation_success"] is True
-    assert observer.observations == [{
+    assert delivered.wait(timeout=2), "background observation was not delivered"
+    observation = observer.observations[0]
+    assert UUID(observation.pop("request_id"))
+    assert observation == {
         "query": "Sensitive medical question",
         "retrieved_chunks": [("chunk-123", 0.83)],
         "retrieval_method": "hybrid",
         "retrieval_latency_ms": 18.0,
         "generation_status": "succeeded",
-    }]
+    }
 
 
 def test_observer_uses_bearer_token_and_redacts_query(monkeypatch):
@@ -117,3 +124,24 @@ def test_observer_delivery_exception_does_not_escape_service(monkeypatch):
 
     assert "".join(stream) == "Private grounded answer"
     assert details["generation_success"] is True
+
+
+def test_observer_retries_rate_limit_response_within_background_worker():
+    delivered = Event()
+    calls = []
+
+    def observe(**_kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            return SimpleNamespace(delivered=False, status_code=429)
+        delivered.set()
+        return SimpleNamespace(delivered=True, status_code=201)
+
+    assert enqueue_observation(
+        SimpleNamespace(observe=observe),
+        query="synthetic test query",
+        request_id="retry-test",
+    ) is True
+
+    assert delivered.wait(timeout=2), "retryable observation was not delivered"
+    assert len(calls) == 2

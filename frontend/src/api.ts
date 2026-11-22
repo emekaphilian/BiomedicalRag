@@ -1,7 +1,19 @@
 const API_BASE = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000";
+let apiToken = "";
+
+export function getApiToken(): string {
+  return apiToken;
+}
+
+export function setApiToken(token: string): void {
+  apiToken = token.trim();
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, init);
+  const headers = new Headers(init?.headers);
+  const token = getApiToken();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const response = await fetch(`${API_BASE}${path}`, { ...init, headers });
   if (!response.ok) {
     let message = `Request failed (${response.status})`;
     try {

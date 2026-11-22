@@ -206,6 +206,9 @@ class GroundedGenerator:
                 if isinstance(block, str):
                     text = block
                 else:
+                    block_type = field(block, "type")
+                    if block_type not in (None, "text"):
+                        continue
                     text = field(block, "text")
                 if isinstance(text, str) and text.strip():
                     text_parts.append(text)

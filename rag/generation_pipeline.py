@@ -65,6 +65,7 @@ class GroundedGenerationPipeline:
         retrieval_mode="hybrid",
         chat_history=None,
         retrieval_query=None,
+        source_screen=None,
     ):
         """
         Generate grounded answer end-to-end.
@@ -150,7 +151,7 @@ class GroundedGenerationPipeline:
                 },
                 "generation": {
                     "answer": refusal,
-                    "model": self.generator.model_name,
+                    "model": getattr(self.generator, "model_name", self.generator_config.get("model_name", "unknown")),
                     "success": True,
                 },
                 "validation": {
@@ -169,6 +170,20 @@ class GroundedGenerationPipeline:
         compressed_context = self.compressor.compress(
             ranked_results
         )
+
+        # Screen the exact compressed evidence items that become the prompt.
+        if source_screen is not None and source_screen(compressed_context["context"]):
+            refusal = "Generation was blocked because retrieved evidence matched a prompt-injection screen."
+            return {
+                "query": query,
+                "retrieval": {"fused_count": len(retrieval_result.get("fused_results", [])), "reranked_count": len(ranked_results), "grounded": False},
+                "compression": {"compressed_count": 0, "sources": [], "evidence": [], "formatted": "Evidence blocked by security screen."},
+                "generation": {"answer": refusal, "model": getattr(self.generator, "model_name", self.generator_config.get("model_name", "unknown")), "success": False},
+                "validation": {"valid": False, "issues": ["Retrieved evidence matched the prompt-injection screen."]},
+                "timings": {"retrieval_time_ms": retrieval_time_ms, "generation_time_ms": 0.0},
+                "final_answer": refusal,
+                "answer_abstained": True,
+            }
 
         # Step 3: Prompt Construction
         prompt = (
@@ -215,7 +230,7 @@ class GroundedGenerationPipeline:
                 },
                 "generation": {
                     "answer": refusal,
-                    "model": self.generator.model_name,
+                    "model": getattr(self.generator, "model_name", self.generator_config.get("model_name", "unknown")),
                     "success": True,
                 },
                 "validation": {
@@ -234,6 +249,7 @@ class GroundedGenerationPipeline:
         validation_result = self.validator.validate(
             generation_result,
             compressed_context["evidence_count"],
+            [item["content"] for item in compressed_context["context"]],
         )
 
         # Step 6: Retry once when grounded evidence exists but citations are missing.
@@ -280,10 +296,22 @@ class GroundedGenerationPipeline:
             retry_validation = self.validator.validate(
                 retry_result,
                 compressed_context["evidence_count"],
+                [item["content"] for item in compressed_context["context"]],
             )
 
             generation_result = retry_result
             validation_result = retry_validation
+
+        answer_abstained = not validation_result["valid"]
+        if answer_abstained:
+            # Never surface unvalidated provider output: it may contain reasoning,
+            # control tokens, or unsupported medical claims.
+            safe_answer = (
+                "I could not provide a reliable answer from the available evidence. "
+                "Please try again or consult a qualified healthcare professional."
+            )
+            generation_result = {**generation_result, "answer": safe_answer}
+            validation_result = {**validation_result, "answer": safe_answer}
 
         return {
             "query": query,
@@ -308,9 +336,6 @@ class GroundedGenerationPipeline:
                 "retrieval_time_ms": retrieval_time_ms,
                 "generation_time_ms": generation_time_ms,
             },
-            "final_answer": generation_result["answer"] if validation_result["valid"] else (
-                f"[VALIDATION FAILED]\n"
-                f"Issues: {', '.join(validation_result['issues'])}\n"
-                f"Original: {generation_result['answer']}"
-            )
+            "final_answer": generation_result["answer"],
+            "answer_abstained": answer_abstained,
         }

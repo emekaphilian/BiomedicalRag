@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
+  getApiToken,
   get,
   post,
   queryPath,
+  setApiToken,
   upload,
   type AuditEvent,
   type DashboardState,
@@ -15,7 +17,7 @@ type QueryResult = {
   event_id: string;
   answer: string;
   sources: EvidenceSource[];
-  details: { is_grounded?: boolean; generation_success?: boolean; answer_abstained?: boolean; warnings?: string[]; validation_passed?: boolean };
+  details: { is_grounded?: boolean; generation_success?: boolean; answer_abstained?: boolean; warnings?: string[]; validation_passed?: boolean; validation_states?: Record<string, boolean | string | null> };
   latency_ms: number;
 };
 
@@ -34,12 +36,20 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "An unexpected error occurred.";
 }
 
+function isBearerAuthError(error: unknown): boolean {
+  return error instanceof Error && error.message.toLowerCase().includes("bearer token");
+}
+
 function Metric({ label, value }: { label: string; value: string | number }) {
   return <div className="metric"><span>{label}</span><strong>{value}</strong></div>;
 }
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("Overview");
+  const [apiToken, setApiTokenState] = useState(getApiToken);
+  const [tokenInput, setTokenInput] = useState("");
+  const [showTokenPrompt, setShowTokenPrompt] = useState(false);
+  const [apiAuthRequired, setApiAuthRequired] = useState(false);
   const [sessionId, setSessionId] = useState("");
   const [dashboard, setDashboard] = useState<DashboardState | null>(null);
   const [error, setError] = useState("");
@@ -92,6 +102,7 @@ export default function App() {
 
   useEffect(() => {
     let active = true;
+
     async function start() {
       try {
         let id = window.localStorage.getItem("biomed-rag-session") ?? "";
@@ -111,12 +122,18 @@ export default function App() {
         setSessionId(id);
         await refreshState(id);
       } catch (cause) {
-        if (active) setError(errorMessage(cause));
+        if (active) {
+          setError(errorMessage(cause));
+          if (isBearerAuthError(cause)) {
+            setApiAuthRequired(true);
+            setShowTokenPrompt(true);
+          }
+        }
       }
     }
     void start();
     return () => { active = false; };
-  }, []);
+  }, [apiToken]);
 
   useEffect(() => {
     if (tab !== "Governance" || !sessionId) return;
@@ -136,6 +153,10 @@ export default function App() {
       await refreshState();
     } catch (cause) {
       setError(errorMessage(cause));
+      if (isBearerAuthError(cause)) {
+        setApiAuthRequired(true);
+        setShowTokenPrompt(true);
+      }
     } finally {
       setBusy(false);
     }
@@ -168,7 +189,6 @@ export default function App() {
       (result) => {
         setAnswer(result);
         setRetrievalAttempted(true);
-        setQuestion("");
       },
     );
   }
@@ -290,6 +310,27 @@ export default function App() {
     });
   }
 
+  function submitApiToken(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const token = tokenInput.trim();
+    if (!token) return;
+    setApiToken(token);
+    setApiTokenState(token);
+    setTokenInput("");
+    setError("");
+    setShowTokenPrompt(false);
+    setApiAuthRequired(false);
+  }
+
+  function signOut() {
+    setApiToken("");
+    setApiTokenState("");
+    setSessionId("");
+    setDashboard(null);
+    setError("");
+    window.localStorage.removeItem("biomed-rag-session");
+  }
+
   const successfulEvents = (dashboard?.events ?? []).filter(
     (event) => event.event === "query" && event.success,
   );
@@ -321,13 +362,33 @@ export default function App() {
         <header className="topbar">
           <div><p className="eyebrow">BIOMEDICAL QUESTION ANSWERING</p><h1>{tab}</h1></div>
           <div className="top-actions">
-            <span className="config-pill">{dashboard?.configuration.version ?? "Connecting…"}</span>
+            <span className="config-pill">{dashboard?.configuration.version ?? (error ? "API unavailable" : "Connecting…")}</span>
             <button className="button quiet" onClick={exportAudit} disabled={!dashboard || busy}>Export audit</button>
+            {apiToken
+              ? <button className="button quiet" onClick={signOut}>Sign out</button>
+              : apiAuthRequired && !showTokenPrompt
+                ? <button className="button primary" onClick={() => setShowTokenPrompt(true)}>Connect API</button>
+                : null}
           </div>
         </header>
 
+        {showTokenPrompt && <section className="panel auth-inline" aria-label="API access">
+          <div className="panel-heading"><h2>Connect to the API</h2><button className="button quiet" type="button" onClick={() => setShowTokenPrompt(false)}>Close</button></div>
+          <p className="muted">Enter your BiomedicalRag bearer token. It stays in page memory and is not included in the frontend build.</p>
+          <form onSubmit={submitApiToken}>
+            <label htmlFor="api-token">Bearer token<input
+              id="api-token"
+              type="password"
+              autoComplete="current-password"
+              value={tokenInput}
+              onChange={(event) => setTokenInput(event.target.value)}
+              required
+            /></label>
+            <button className="button primary" type="submit">Connect</button>
+          </form>
+        </section>}
         {error && <div className="alert error" role="alert"><strong>Request failed</strong><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError("")}>×</button></div>}
-        {!dashboard && <div className="alert"><span>Connecting to the Python API…</span></div>}
+        {!dashboard && !error && <div className="alert"><span>Connecting to the Python API…</span></div>}
 
         <section className="config-card">
           <div className="config-heading"><div><h2>Model connection</h2><p>Provider credentials stay on the API server.</p></div>
@@ -348,7 +409,7 @@ export default function App() {
             <Metric label="Indexed documents" value={dashboard?.document_count ?? 0} />
             <Metric label="Indexed chunks" value={dashboard?.chunk_count ?? 0} />
             <Metric label="Successful queries" value={dashboard?.summary.successful_queries ?? 0} />
-            <Metric label="Grounded answers" value={dashboard?.summary.grounded_queries ?? 0} />
+            <Metric label="Legacy composite pass count" value={dashboard?.summary.grounded_queries ?? 0} />
             <Metric label="Mean latency" value={`${Math.round(dashboard?.summary.mean_latency_ms ?? 0)} ms`} />
           </div>
           <div className="panel"><div className="panel-heading"><h3>Recent activity</h3><span>{dashboard?.events.length ?? 0} events</span></div><EventTable events={dashboard?.events.slice(-8).reverse() ?? []} /></div>
@@ -379,9 +440,10 @@ export default function App() {
               <label htmlFor="question">Biomedical question</label>
               <textarea id="question" value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="How does Parkinson's disease affect dopamine?" rows={4} />
               <div className="button-row"><button className="button primary" onClick={submitQuery} disabled={busy || !dashboard?.configured || !question.trim()}>Ask with RAG</button><button className="button" onClick={retrieveEvidence} disabled={busy || !dashboard?.configured || !question.trim()}>Retrieve evidence</button></div>
-              {!dashboard?.configured && <p className="help-text">Connect a model above before querying.</p>}
+              {!dashboard?.configured && <p className="help-text">{apiToken ? "Connect a model above before querying." : "Connect to the API to load a session and configure a model."}</p>}
               {!!previousTurns.length && <div className="chat-history" aria-label="Previous conversation turns"><div className="history-heading">Previous questions in this session</div>{previousTurns.map((turn) => <article className="history-turn" key={turn.id}><p><strong>You</strong>{turn.query}</p><p><strong>{turn.success ? "BioMed RAG" : "Generation failed"}</strong>{String(turn.answer ?? turn.error ?? "No answer was recorded.")}</p></article>)}</div>}
-              {answer && <div className="answer-card"><div className="answer-status">{answer.details.generation_success === false ? "GENERATION FAILED" : answer.details.answer_abstained ? "NO MATCHING EVIDENCE" : answer.details.is_grounded ? "EVIDENCE GROUNDED" : "GROUNDING NOT CONFIRMED"}<span>{(answer.latency_ms / 1000).toFixed(1)} s</span></div><p>{answer.answer}</p>
+              {answer && <div className="answer-card"><div className="answer-status">{answer.details.generation_success === false ? "GENERATION FAILED" : answer.details.answer_abstained ? "ABSTAINED" : "CHECKS REPORTED BELOW"}<span>{(answer.latency_ms / 1000).toFixed(1)} s</span></div><p>{answer.answer}</p>
+                <div className="validation-states"><strong>Validation states</strong>{Object.entries(answer.details.validation_states ?? {}).filter(([key]) => key !== "claim_support_method").map(([key, value]) => <div key={key}><span>{key.replaceAll("_", " ")}</span><b>{value === true ? "YES" : value === false ? "NO" : value === null ? "NOT EVALUATED" : String(value)}</b></div>)}<small>Claim support is a lexical screen. Medical accuracy is not established by this system.</small></div>
                 {!!answer.details.warnings?.length && <div className="alert warning">{answer.details.warnings.join("; ")}</div>}
                 {answer.details.generation_success !== false && !answer.details.answer_abstained && <button className="text-button" onClick={() => { setAuditAnswerText(answer.answer); setAuditEvidence(answer.sources.map((source) => (source.text ?? "").replace(/\s+/g, " ").trim()).join("\n")); setTab("Evaluation"); }}>Audit this answer →</button>}
               </div>}

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { getApiToken, setApiToken } from "./api";
 import type { AuditEvent, DashboardState } from "./api";
 import App from "./App";
 
@@ -40,6 +41,7 @@ function stateResponse(): DashboardState {
 describe("research dashboard", () => {
   beforeEach(() => {
     window.localStorage.clear();
+    setApiToken("researcher-test-token");
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/api/sessions")) {
@@ -63,6 +65,7 @@ describe("research dashboard", () => {
 
   afterEach(() => {
     cleanup();
+    setApiToken("");
     vi.unstubAllGlobals();
   });
 
@@ -71,6 +74,36 @@ describe("research dashboard", () => {
     expect(await screen.findByText("System overview")).toBeInTheDocument();
     expect(screen.getByText("Successful queries")).toBeInTheDocument();
     expect(window.localStorage.getItem("biomed-rag-session")).toBe("session-test");
+  });
+
+  it("sends the browser-session bearer token with API requests", async () => {
+    const requestHeaders: Headers[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requestHeaders.push(new Headers(init?.headers));
+      const url = String(input);
+      const body = url.endsWith("/api/sessions")
+        ? { session_id: "session-test", created_at: "2026-01-01T00:00:00Z" }
+        : stateResponse();
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }));
+
+    render(<App />);
+    await screen.findByText("System overview");
+
+    expect(requestHeaders.length).toBeGreaterThan(0);
+    expect(requestHeaders[0].get("Authorization")).toBe("Bearer researcher-test-token");
+  });
+
+  it("loads the standalone workspace without requesting a browser token", async () => {
+    setApiToken("");
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "System overview" })).toBeInTheDocument();
+    expect(screen.queryByLabelText("Bearer token")).not.toBeInTheDocument();
+    expect(getApiToken()).toBe("");
   });
 
   it("navigates between the research and governance surfaces", async () => {
@@ -117,6 +150,6 @@ describe("research dashboard", () => {
       { status: 503, headers: { "Content-Type": "application/json" } },
     )));
     render(<App />);
-    expect(await screen.findByText("API unavailable")).toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent("API unavailable");
   });
 });

@@ -107,6 +107,15 @@ def test_cohere_response_parser_handles_json_blocks_and_gateway_text_fields():
     assert GroundedGenerator._cohere_response_text({"text": "Gateway answer."}) == "Gateway answer."
 
 
+def test_cohere_response_parser_ignores_non_text_reasoning_blocks():
+    assert GroundedGenerator._cohere_response_text({
+        "message": {"content": [
+            {"type": "thinking", "text": "private reasoning"},
+            {"type": "text", "text": "Grounded answer [Evidence 1]."},
+        ]},
+    }) == "Grounded answer [Evidence 1]."
+
+
 def test_cohere_provider_rejects_response_without_text_content(monkeypatch):
     class FakeClient:
         def __init__(self, api_key):

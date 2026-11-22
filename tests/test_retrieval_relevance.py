@@ -30,6 +30,10 @@ def test_topic_gate_excludes_unrelated_passages():
     assert not has_topic_overlap(query, ["H. pylori can cause peptic ulcers."])
 
 
+def test_topic_gate_rejects_greeting_instead_of_using_arbitrary_evidence():
+    assert not has_topic_overlap("hi", ["Speech and language problems in children."])
+
+
 def test_hybrid_retriever_filters_dense_neighbors_without_topic_match(monkeypatch):
     relevant = BiomedicalDocument(
         "Parkinson's disease can affect dopamine-producing nerve cells.",

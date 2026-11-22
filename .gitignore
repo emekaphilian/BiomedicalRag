@@ -57,6 +57,7 @@ data/index/
 data/*.jsonl
 data/**/*.json
 data/**/*.zip
+data/*.sqlite3
 
 # Results and outputs (large)
 results/
