@@ -14,6 +14,17 @@ _STOP = frozenset(
 _CITATION = re.compile(r"\[(?:evidence\s+)?(\d+)\]", re.IGNORECASE)
 _NUMBER = re.compile(r"\d+(?:\.\d+)?")
 _WORD = re.compile(r"[a-z0-9]+")
+_EQUIVALENT_TERMS = {
+    # Established plain-language biomedical equivalents used to prevent a
+    # brittle string mismatch. These normalize overlap; they do not prove entailment.
+    "sugar": "glucose",
+    "elevated": "high",
+    "increased": "high",
+    "increas": "high",
+    "symptom": "symptom",
+    "sign": "symptom",
+    "manifestation": "symptom",
+}
 
 
 def _stem(token: str) -> str:
@@ -21,7 +32,10 @@ def _stem(token: str) -> str:
 
 
 def content_tokens(text: str) -> set:
-    tokens = (_stem(token) for token in _WORD.findall(_CITATION.sub(" ", text or "").lower()))
+    tokens = (
+        _EQUIVALENT_TERMS.get(_stem(token), _stem(token))
+        for token in _WORD.findall(_CITATION.sub(" ", text or "").lower())
+    )
     return {token for token in tokens if token not in _STOP and (len(token) >= 3 or token.isdigit())}
 
 

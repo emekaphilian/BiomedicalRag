@@ -12,12 +12,12 @@ import {
 } from "./api";
 
 type Tab = "Overview" | "Knowledge" | "Playground" | "Evaluation" | "Governance" | "Audit";
-type EvidenceSource = { evidence_id?: string; source?: string; text?: string; prompt_excerpt?: string; score?: number; rerank_score?: number; rank?: number; url?: string; source_provider?: string; source_origin?: string; source_quality?: string };
+type EvidenceSource = { evidence_id?: string; source?: string; text?: string; prompt_excerpt?: string; score?: number; rerank_score?: number; rank?: number; url?: string; source_provider?: string; source_origin?: string; source_quality?: string; evidence_classification?: { category?: string; reason?: string } };
 type QueryResult = {
   event_id: string;
   answer: string;
   sources: EvidenceSource[];
-  details: { is_grounded?: boolean; generation_success?: boolean; answer_abstained?: boolean; decision?: string; rejection_reason?: string | null; risk_tier?: string; question_category?: string; evidence_confidence?: string | null; confidence_basis?: string | null; claim_support?: Array<Record<string, unknown>>; validation_diagnostics?: { factual_sentence_count?: number; citation_coverage?: number | null; citation_support_coverage?: number | null; lexical_support?: number | null; method?: string } | null; warnings?: string[]; validation_passed?: boolean; validation_states?: Record<string, boolean | string | null> };
+  details: { is_grounded?: boolean; generation_success?: boolean; answer_abstained?: boolean; decision?: string; rejection_reason?: string | null; risk_tier?: string; question_category?: string; evidence_confidence?: string | null; confidence_basis?: string | null; claim_support?: Array<Record<string, unknown>>; audit_trace?: { evidence_audit?: { relevance_counts?: Record<string, number>; reason?: string } }; validation_diagnostics?: { factual_sentence_count?: number; citation_coverage?: number | null; citation_support_coverage?: number | null; lexical_support?: number | null; method?: string } | null; warnings?: string[]; validation_passed?: boolean; validation_states?: Record<string, boolean | string | null> };
   latency_ms: number;
 };
 
@@ -57,12 +57,13 @@ function rejectionLabel(reason?: string | null) {
   return REJECTION_LABELS[reason] ?? reason.replaceAll("_", " ");
 }
 
-type ResultState = "approved" | "informational" | "validation_review_required" | "insufficient" | "no_relevant_evidence" | "evidence_extraction_failed" | "safety_override" | "out_of_scope" | "generation_failed";
+type ResultState = "approved" | "informational" | "validation_review_required" | "conflicting_evidence" | "insufficient" | "no_relevant_evidence" | "evidence_extraction_failed" | "safety_override" | "out_of_scope" | "generation_failed";
 
 function resultState(decision?: string, answerAbstained?: boolean, reason?: string | null, success?: boolean, answer?: string): ResultState {
   if (decision === "safety_override" || reason?.startsWith("medical_")) return "safety_override";
   if (decision === "out_of_scope" || reason === "non_medical_question") return "out_of_scope";
   if (decision === "validation_review_required") return "validation_review_required";
+  if (decision === "conflicting_evidence") return "conflicting_evidence";
   if (decision === "no_relevant_evidence" || reason === "no_relevant_evidence") return "no_relevant_evidence";
   if (decision === "evidence_extraction_failed" || reason === "evidence_extraction_failed") return "evidence_extraction_failed";
   if (decision === "generation_failed") return "generation_failed";
@@ -74,7 +75,7 @@ function resultState(decision?: string, answerAbstained?: boolean, reason?: stri
 }
 
 function outcomeLabel(state: ResultState) {
-  return ({ approved: "Verified answer", informational: "Informational answer", validation_review_required: "Validation review required", insufficient: "Insufficient Supporting Evidence", no_relevant_evidence: "No Relevant Evidence Found", evidence_extraction_failed: "Evidence Extraction Failed", safety_override: "Medical safety override", out_of_scope: "Medical questions only", generation_failed: "Answer generation failed" })[state];
+  return ({ approved: "Verified answer", informational: "Informational answer", validation_review_required: "Validation review required", conflicting_evidence: "Conflicting evidence warning", insufficient: "Insufficient Supporting Evidence", no_relevant_evidence: "No Relevant Evidence Found", evidence_extraction_failed: "Evidence Extraction Failed", safety_override: "Medical safety override", out_of_scope: "Medical questions only", generation_failed: "Answer generation failed" })[state];
 }
 
 function outcomeTone(state: ResultState) {
@@ -100,6 +101,7 @@ function stateAnswer(state: ResultState, answer: string, sourceCount = 0) {
 }
 
 function whySummary(decision?: string, reason?: string | null) {
+  if (decision === "conflicting_evidence" || reason === "conflicting_evidence") return "Relevant passages contained explicit opposing factual terms. The disagreement remains unresolved, so the system withheld an answer; inspect the cited evidence and source context.";
   if (decision === "informational" && reason === "extractive_evidence_fallback") return "The model did not produce a usable answer, so this informational response quotes a relevant retrieved passage with its evidence citation. Review the source before relying on it; BioMed RAG does not establish clinical accuracy.";
   if (decision === "informational" && reason === "external_source_quality_unverified") return "The answer passed the evidence and citation checks, but it uses external research sources whose quality BioMed RAG has not independently verified. Review the linked source records.";
   if (decision === "informational" && reason === "retrieval_relevance_limited") return "Topic-matched evidence was retrieved, but the retrieval score was below the usual threshold. The answer uses the available passages and should be checked against the linked sources.";
@@ -117,9 +119,20 @@ function whySummary(decision?: string, reason?: string | null) {
 }
 
 function outcomeWhySummary(state: ResultState, decision?: string, reason?: string | null) {
+  if (state === "conflicting_evidence") return "Relevant passages contain opposing factual statements. The system withheld an answer and retained both sources so the disagreement can be reviewed.";
   if (state === "evidence_extraction_failed") return "A source record was found, but no usable passage text was retained for answer generation. The source title alone is not enough to ground a medical answer.";
   if (state === "insufficient" && reason === "evidence_too_weak") return "Relevant source excerpts were retrieved, but they did not contain enough validated support for an answer. Review them in Sources or Audit.";
   return whySummary(decision, reason);
+}
+
+function validationIssue(value: string) {
+  const message = value.toLowerCase();
+  if (message.includes("failed the lexical claim-support screen")) return "A factual claim could not be matched by the lexical support screen. This screen can miss valid paraphrases; inspect the cited passage.";
+  if (message.includes("lack a citation linked to overlapping evidence")) return "A citation was present, but the passage did not overlap enough with the claim to verify the citation link.";
+  if (message.includes("lack a citation")) return "A factual statement is missing an inline evidence citation.";
+  if (message.includes("does not directly establish") || message.includes("related condition")) return "The retrieved passages concern a related subject but do not directly establish the requested information.";
+  if (message.includes("contradict")) return "The retrieved sources contain opposing information; review their source context before drawing a conclusion.";
+  return value;
 }
 
 function percentage(value?: number | null) {
@@ -632,7 +645,7 @@ export default function App() {
           </div>
           <div className="chat-thread">
             {!previousTurns.length && !answer && <div className="chat-welcome"><span className="welcome-mark">B</span><h2>What would you like to research?</h2><p>Ask a biomedical question. Responses are grounded in your indexed evidence.</p><div className="suggestion-row">{["How does Parkinson’s disease affect dopamine?", "What are common symptoms of diabetes?"].map((suggestion) => <button key={suggestion} onClick={() => setQuestion(suggestion)}>{suggestion}<span>↗</span></button>)}</div></div>}
-            {[...previousTurns].reverse().map((turn) => { const decision = String(turn.decision ?? (turn.success ? "answer_approved" : "insufficient_evidence")); const warnings = Array.isArray(turn.warnings) ? turn.warnings : []; const hasEvidenceRecord = Array.isArray(turn.retrieved_evidence); const savedEvidence = hasEvidenceRecord ? turn.retrieved_evidence as EvidenceSource[] : []; const savedNames = Array.isArray(turn.sources) ? turn.sources.map((source) => ({ source: String(source) })) : []; const oldSources = savedEvidence.length ? savedEvidence : savedNames; const body = String(turn.answer ?? turn.error ?? ""); const state = historyResultState(turn); const hasAnswer = state === "approved" || state === "informational"; const missingEvidenceMessage = hasEvidenceRecord ? "The retrieved source record contains no passage text." : "This response predates passage retention. Re-run the question to capture its evidence excerpts."; return <article className="chat-turn" key={turn.id}><div className="user-message"><span className="message-avatar">You</span><p>{String(turn.query ?? "")}</p></div><div className="assistant-message"><span className="assistant-avatar">B</span><div className="assistant-body"><div className="answer-status"><span className={`outcome-pill ${outcomeTone(state)}`}>{outcomeLabel(state)}</span></div><p><AnswerText text={answerParts(stateAnswer(state, hasAnswer || state === "safety_override" ? body : "", Number(turn.source_count ?? oldSources.length))).answer} /></p><EvidenceConfidence level={String(turn.evidence_confidence ?? "")} basis={String(turn.confidence_basis ?? "")} /><SourceSummary sources={oldSources} />{state !== "approved" && <details className="why-answer"><summary>{state === "validation_review_required" ? "Validation findings" : "Why this result?"}</summary><p>{outcomeWhySummary(state, decision, String(turn.rejection_reason ?? ""))}</p><p>{state === "validation_review_required" ? "Evidence found" : "Retrieved"}: {String(turn.source_count ?? 0)} passages.</p>{warnings.length > 0 && <ul>{warnings.map((warning, index) => <li key={`${warning}-${index}`}>{warning}</li>)}</ul>}</details>}<details className="inline-evidence" open><summary>Evidence and sources ({oldSources.length || Number(turn.source_count ?? 0)})</summary><EvidenceList sources={oldSources} emptyMessage={missingEvidenceMessage} missingTextMessage={missingEvidenceMessage} /></details><button className="text-button view-audit-link" onClick={() => setTab("Audit")}>View audit →</button></div></div></article>; })}
+            {[...previousTurns].reverse().map((turn) => { const decision = String(turn.decision ?? (turn.success ? "answer_approved" : "insufficient_evidence")); const warnings = Array.isArray(turn.warnings) ? turn.warnings : []; const hasEvidenceRecord = Array.isArray(turn.retrieved_evidence); const savedEvidence = hasEvidenceRecord ? turn.retrieved_evidence as EvidenceSource[] : []; const savedNames = Array.isArray(turn.sources) ? turn.sources.map((source) => ({ source: String(source) })) : []; const oldSources = savedEvidence.length ? savedEvidence : savedNames; const body = String(turn.answer ?? turn.error ?? ""); const state = historyResultState(turn); const hasAnswer = state === "approved" || state === "informational" || state === "conflicting_evidence"; const missingEvidenceMessage = hasEvidenceRecord ? "The retrieved source record contains no passage text." : "This response predates passage retention. Re-run the question to capture its evidence excerpts."; const relevanceAudit = turn.audit_trace as { evidence_audit?: { relevance_counts?: Record<string, number>; reason?: string } } | undefined; return <article className="chat-turn" key={turn.id}><div className="user-message"><span className="message-avatar">You</span><p>{String(turn.query ?? "")}</p></div><div className="assistant-message"><span className="assistant-avatar">B</span><div className="assistant-body"><div className="answer-status"><span className={`outcome-pill ${outcomeTone(state)}`}>{outcomeLabel(state)}</span></div><p><AnswerText text={answerParts(stateAnswer(state, hasAnswer || state === "safety_override" ? body : "", Number(turn.source_count ?? oldSources.length))).answer} /></p><EvidenceConfidence level={String(turn.evidence_confidence ?? "")} basis={String(turn.confidence_basis ?? "")} /><SourceSummary sources={oldSources} /><EvidenceRelevanceSummary counts={relevanceAudit?.evidence_audit?.relevance_counts} reason={relevanceAudit?.evidence_audit?.reason} />{state !== "approved" && <details className="why-answer"><summary>{state === "validation_review_required" ? "Validation findings" : "Why this result?"}</summary><p>{outcomeWhySummary(state, decision, String(turn.rejection_reason ?? ""))}</p><p>{state === "validation_review_required" ? "Evidence found" : "Retrieved"}: {String(turn.source_count ?? 0)} passages.</p>{warnings.length > 0 && <ul>{warnings.map((warning, index) => <li key={`${warning}-${index}`}>{validationIssue(String(warning))}</li>)}</ul>}</details>}<details className="inline-evidence" open><summary>Evidence and sources ({oldSources.length || Number(turn.source_count ?? 0)})</summary><EvidenceList sources={oldSources} emptyMessage={missingEvidenceMessage} missingTextMessage={missingEvidenceMessage} /></details><button className="text-button view-audit-link" onClick={() => setTab("Audit")}>View audit →</button></div></div></article>; })}
             {answer && <article className="chat-turn current-turn"><div className="user-message"><span className="message-avatar">You</span><p>{answeredQuestion}</p></div><div className="assistant-message"><span className="assistant-avatar">B</span><div className={`assistant-body ${(currentResultState === "insufficient" || currentResultState === "evidence_extraction_failed") ? "abstained" : ""}`}>
               <div className="answer-status"><span className={`outcome-pill ${outcomeTone(currentResultState)}`}>{outcomeLabel(currentResultState)}</span></div>
               {currentResultState === "informational" && <p className="outcome-subtitle">Evidence was found, but source verification or one or more validation checks are incomplete. Review the sources before relying on this answer.</p>}
@@ -640,11 +653,12 @@ export default function App() {
               {currentResultState === "insufficient" || currentResultState === "evidence_extraction_failed" ? <p className="chat-answer-text abstained-message">{currentAnswerBody}</p> : (() => { const parts = answerParts(currentAnswerBody); return <><p className="chat-answer-text"><AnswerText text={parts.answer} /></p>{parts.disclaimer && <p className="medical-disclaimer"><span aria-hidden="true">⚠</span><span><strong>Medical disclaimer</strong>{parts.disclaimer}</span></p>}</>; })()}
               <EvidenceConfidence level={answer.details.evidence_confidence} basis={answer.details.confidence_basis} />
               <SourceSummary sources={answer.sources} />
+              <EvidenceRelevanceSummary counts={answer.details.audit_trace?.evidence_audit?.relevance_counts} reason={answer.details.audit_trace?.evidence_audit?.reason} />
               <div className="validation-states"><strong>Validation checks</strong><div className="validation-grid">{Object.entries(answer.details.validation_states ?? {}).filter(([key]) => key !== "claim_support_method").map(([key, value]) => { const result = key === "ANSWER_QUALITY_EVALUATED" && currentAnswerReviewed ? { label: "Human reviewed", state: "passed" } : validationValue(value); return <div className={`validation-item ${result.state}`} key={key}><span>{VALIDATION_LABELS[key] ?? key.replaceAll("_", " ")}</span><b>{result.label}</b></div>; })}</div><small>Answer quality is not scored automatically; use Human answer review for human ratings. Claim support is a lexical overlap screen, not semantic verification. Medical accuracy requires qualified human review and is not established by this system.</small>
                 {answer.details.validation_diagnostics && <div className="audit-metrics"><strong>Lexical audit diagnostics</strong><span>Citation coverage <b>{percentage(answer.details.validation_diagnostics.citation_coverage)}</b></span><span>Citation-linked support <b>{percentage(answer.details.validation_diagnostics.citation_support_coverage)}</b></span><span>Lexical overlap <b>{percentage(answer.details.validation_diagnostics.lexical_support)}</b></span><small>Heuristic diagnostics, not calibrated confidence.</small></div>}
               </div>
-              {(currentResultState !== "approved") && <details className="why-answer"><summary>{currentResultState === "validation_review_required" ? "Validation findings" : "Why this result?"}</summary><p>{outcomeWhySummary(currentResultState, answer.details.decision, answer.details.rejection_reason)}</p>{answer.details.risk_tier === "R4" && <p>If symptoms may be life-threatening, contact local emergency services now.</p>}<p>{currentResultState === "validation_review_required" ? "Evidence found" : "Retrieved"}: {answer.sources.length} passage{answer.sources.length === 1 ? "" : "s"}.</p>{!!answer.details.warnings?.length && <ul>{answer.details.warnings.map((warning, index) => <li key={`${warning}-${index}`}>{warning}</li>)}</ul>}{currentResultState !== "safety_override" && <p>Source quality and clinical accuracy are not independently verified by BioMed RAG.</p>}</details>}
-              {!!answer.details.warnings?.length && <details className="validation-details"><summary>Why checks failed ({answer.details.warnings.length})</summary><ul>{answer.details.warnings.map((warning, index) => <li key={`${warning}-${index}`}>{warning}</li>)}</ul></details>}
+              {(currentResultState !== "approved") && <details className="why-answer"><summary>{currentResultState === "validation_review_required" ? "Validation findings" : "Why this result?"}</summary><p>{outcomeWhySummary(currentResultState, answer.details.decision, answer.details.rejection_reason)}</p>{answer.details.risk_tier === "R4" && <p>If symptoms may be life-threatening, contact local emergency services now.</p>}<p>{currentResultState === "validation_review_required" ? "Evidence found" : "Retrieved"}: {answer.sources.length} passage{answer.sources.length === 1 ? "" : "s"}.</p>{!!answer.details.warnings?.length && <ul>{answer.details.warnings.map((warning, index) => <li key={`${warning}-${index}`}>{validationIssue(String(warning))}</li>)}</ul>}{currentResultState !== "safety_override" && <p>Source quality and clinical accuracy are not independently verified by BioMed RAG.</p>}</details>}
+              {!!answer.details.warnings?.length && <details className="validation-details"><summary>Why checks failed ({answer.details.warnings.length})</summary><ul>{answer.details.warnings.map((warning, index) => <li key={`${warning}-${index}`}>{validationIssue(String(warning))}</li>)}</ul></details>}
               {answer.details.generation_success !== false && !answer.details.answer_abstained && <button className="text-button" onClick={() => { setAuditAnswerText(answer.answer); setAuditEvidence(answer.sources.map((source) => (source.text ?? "").replace(/\s+/g, " ").trim()).join("\n")); setTab("Evaluation"); }}>Audit this answer →</button>}
               <button className="text-button view-audit-link" onClick={() => setTab("Audit")}>View audit →</button>
               <details className="inline-evidence" open><summary>Evidence and sources ({answer.sources.length})</summary><EvidenceList sources={answer.sources} emptyMessage="No passage text was returned by retrieval for this response." /></details>
@@ -675,7 +689,7 @@ export default function App() {
               {!!previousTurns.length && <div className="chat-history" aria-label="Previous conversation turns"><div className="history-heading">Previous questions in this session</div>{previousTurns.map((turn) => <article className="history-turn" key={turn.id}><p><strong>You</strong>{turn.query}</p><p><strong>{turn.success ? "BioMed RAG" : "Generation failed"}</strong>{String(turn.answer ?? turn.error ?? "No answer was recorded.")}</p></article>)}</div>}
               {answer && <div className="answer-card"><div className="answer-status">{answer.details.generation_success === false ? "GENERATION FAILED" : answer.details.answer_abstained ? "ABSTAINED" : "CHECKS REPORTED BELOW"}<span>{(answer.latency_ms / 1000).toFixed(1)} s</span></div>{(() => { const parts = answerParts(answer.answer); return <><p>{parts.answer}</p>{parts.disclaimer && <p className="medical-disclaimer"><span aria-hidden="true">⚠</span><span><strong>Medical disclaimer</strong>{parts.disclaimer}</span></p>}</>; })()}
                 <div className="validation-states"><strong>Validation checks</strong><div className="validation-grid">{Object.entries(answer.details.validation_states ?? {}).filter(([key]) => key !== "claim_support_method").map(([key, value]) => { const result = validationValue(value); return <div className={`validation-item ${result.state}`} key={key}><span>{VALIDATION_LABELS[key] ?? key.replaceAll("_", " ")}</span><b>{result.label}</b></div>; })}</div><small>Claim support is a lexical overlap screen. Medical accuracy is not established by this system.</small></div>
-                {!!answer.details.warnings?.length && <details className="validation-details"><summary>Why checks failed ({answer.details.warnings.length})</summary><ul>{answer.details.warnings.map((warning, index) => <li key={`${warning}-${index}`}>{warning}</li>)}</ul></details>}
+                {!!answer.details.warnings?.length && <details className="validation-details"><summary>Why checks failed ({answer.details.warnings.length})</summary><ul>{answer.details.warnings.map((warning, index) => <li key={`${warning}-${index}`}>{validationIssue(String(warning))}</li>)}</ul></details>}
                 {answer.details.generation_success !== false && !answer.details.answer_abstained && <button className="text-button" onClick={() => { setAuditAnswerText(answer.answer); setAuditEvidence(answer.sources.map((source) => (source.text ?? "").replace(/\s+/g, " ").trim()).join("\n")); setTab("Evaluation"); }}>Audit this answer →</button>}
               </div>}
             </div>
@@ -792,10 +806,25 @@ export default function App() {
 function EvidenceList({ sources, emptyMessage, missingTextMessage = "No source excerpt was retained with this result.", showScores = false }: { sources: EvidenceSource[]; emptyMessage?: string; missingTextMessage?: string; showScores?: boolean }) {
   if (!sources.length) return <p className="empty">{emptyMessage ?? "Evidence will appear after retrieval."}</p>;
   return <div className="evidence-list">{sources.map((source, index) => <article className="evidence-item" key={`${source.source ?? "source"}-${index}`}>
-    <div id={source.evidence_id ?? `evidence-${index + 1}`} className="evidence-heading"><span className="source-rank">{source.evidence_id ?? `Evidence ${index + 1}`}</span><strong>{source.source ?? "Biomedical source"}</strong>{source.source_origin === "external" && <span className="source-origin">External research · not independently verified</span>}{source.url?.startsWith("https://") && <a className="source-link" href={source.url} target="_blank" rel="noreferrer">Open source ↗</a>}{showScores && (source.rerank_score ?? source.score) != null && <span className="source-score">rank score {Number(source.rerank_score ?? source.score).toFixed(3)}</span>}</div>
+    <div id={source.evidence_id ?? `evidence-${index + 1}`} className="evidence-heading"><span className="source-rank">{source.evidence_id ?? `Evidence ${index + 1}`}</span><strong>{source.source ?? "Biomedical source"}</strong>{source.evidence_classification?.category && <span className="source-origin">{source.evidence_classification.category.replaceAll("_", " ")}</span>}{source.source_origin === "external" && <span className="source-origin">External research · not independently verified</span>}{source.url?.startsWith("https://") && <a className="source-link" href={source.url} target="_blank" rel="noreferrer">Open source ↗</a>}{showScores && (source.rerank_score ?? source.score) != null && <span className="source-score">rank score {Number(source.rerank_score ?? source.score).toFixed(3)}</span>}</div>
     <p>{source.text?.trim() || missingTextMessage}</p>
     {!!source.prompt_excerpt?.trim() && source.prompt_excerpt.trim() !== source.text?.trim() && <details className="prompt-excerpt"><summary>Passage excerpt used for the answer</summary><p>{source.prompt_excerpt.trim()}</p></details>}
   </article>)}</div>;
+}
+
+function EvidenceRelevanceSummary({ counts, reason }: { counts?: Record<string, number>; reason?: string }) {
+  if (!counts || !Object.keys(counts).length) return null;
+  const labels: Record<string, string> = {
+    direct: "Direct", supporting_contextual: "Supporting / contextual",
+    related_indirect: "Related / indirect", complication: "Complication",
+    contradictory: "Contradictory", irrelevant: "Irrelevant", uncertain: "Uncertain",
+  };
+  const directCount = counts.direct ?? 0;
+  return <details className="why-answer evidence-relevance" open={directCount === 0}>
+    <summary>{directCount ? "Evidence relevance" : "Evidence relevance: Related, but not sufficiently direct"}</summary>
+    {reason && <p>{reason}</p>}
+    <ul>{Object.entries(labels).map(([key, label]) => <li key={key}>{label}: {counts[key] ?? 0}</li>)}</ul>
+  </details>;
 }
 
 function AnswerText({ text }: { text: string }) {
@@ -836,6 +865,7 @@ function SourceSummary({ sources }: { sources: EvidenceSource[] }) {
 function eventStatus(event: AuditEvent) {
   if (event.decision === "answer_approved") return "Verified";
   if (event.decision === "informational") return "Informational";
+  if (event.decision === "conflicting_evidence") return "Conflicting evidence";
   if (event.decision === "validation_review_required") return "Validation review";
   if (event.decision === "safety_override") return "Safety override";
   if (event.decision === "out_of_scope") return "Out of scope";

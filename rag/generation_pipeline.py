@@ -16,6 +16,7 @@ from rag.medical_risk import classify_medical_risk, is_medical_followup, is_medi
 from rag.external_sources import retrieve_pubmed
 from rag.post_validation import PostGenerationValidator
 from dashboard.rag_audit import content_tokens, split_sentences
+from rag.evidence_relevance import classify_evidence_set, interpret_query
 
 
 def _extractive_fallback(query, evidence_items):
@@ -161,6 +162,8 @@ class GroundedGenerationPipeline:
 
         retrieval_started = perf_counter()
         search_query = retrieval_query or query
+        query_intent = interpret_query(search_query)
+        retrieval_search_query = query_intent.retrieval_query
         hybrid_retriever = getattr(self.retriever, "hybrid_retriever", self.retriever)
         dense_retriever = getattr(hybrid_retriever, "dense_retriever", None)
         if dense_retriever is None or getattr(dense_retriever, "vectorstore", None) is None:
@@ -174,13 +177,13 @@ class GroundedGenerationPipeline:
             ranked_results = []
         elif self.use_reranking:
             retrieval_result = self.retriever.retrieve(
-                search_query,
-                k=k,
+                retrieval_search_query,
+                k=retrieval_k,
                 retrieval_k=retrieval_k,
             )
             ranked_results = retrieval_result["reranked_results"]
         else:
-            hybrid_result = self.retriever.retrieve(search_query, k=retrieval_k)
+            hybrid_result = self.retriever.retrieve(retrieval_search_query, k=retrieval_k)
             metadata_by_content = {}
             for document in self.documents:
                 metadata_by_content.setdefault(
@@ -205,9 +208,9 @@ class GroundedGenerationPipeline:
                     "metadata": metadata_by_content[content],
                     "rerank_score": score,
                 }
-                for content, score in selected_results
+                for content, score in selected_results[:retrieval_k]
                 if content in metadata_by_content
-            ][:k]
+            ]
             retrieval_result = {
                 **hybrid_result,
                 "grounded": (
@@ -240,9 +243,135 @@ class GroundedGenerationPipeline:
                     ranked_results = (relevant_external + ranked_results[:max(0, k - len(relevant_external))])[:max(k, 3)]
                 retrieval_result = {**retrieval_result, "grounded": True}
 
-        if not ranked_results or not has_topic_overlap(
-            search_query,
-            [item.get("content", "") for item in ranked_results],
+        relevance_order = {
+            "direct": 0, "supporting_contextual": 1,
+            "related_indirect": 2, "complication": 3,
+            "contradictory": 4, "irrelevant": 5, "uncertain": 6,
+        }
+        classifications = classify_evidence_set(query, ranked_results)
+        for item, classification in zip(ranked_results, classifications):
+            item["evidence_classification"] = classification
+        ranked_results.sort(key=lambda item: (
+            relevance_order.get(item["evidence_classification"]["category"], 9),
+            -float(item.get("rerank_score", item.get("fusion_score", 0.0)) or 0.0),
+        ))
+        ranked_results = ranked_results[:k]
+        relevance_counts = {
+            category: sum(
+                item["evidence_classification"]["category"] == category
+                for item in ranked_results
+            )
+            for category in relevance_order
+        }
+        intent_specific = query_intent.information_type != "general"
+        if (
+            ranked_results and query_intent.subject_terms
+            and (
+                relevance_counts["contradictory"] > 0
+                or (intent_specific and relevance_counts["direct"] == 0)
+            )
+        ):
+            refusal = (
+                "Related biomedical sources were retrieved, but none directly addresses "
+                f"the requested {query_intent.information_type} information. The available "
+                "passages do not establish the central answer, so it has been withheld."
+            )
+            insufficient_context = self.compressor.compress(ranked_results)
+            for evidence_index, evidence in enumerate(insufficient_context.get("context", []), 1):
+                evidence["evidence_classification"] = ranked_results[evidence_index - 1].get("evidence_classification")
+            evidence_audit = {
+                "question_classification": {
+                    "subject_terms": list(query_intent.subject_terms),
+                    "information_type": query_intent.information_type,
+                    "expected_evidence": list(query_intent.expected_evidence),
+                },
+                "retrieval_configuration": {
+                    "mode": retrieval_mode, "top_k": k, "retrieval_k": retrieval_k,
+                    "expanded_query": retrieval_search_query,
+                },
+                "retrieved_evidence_count": len(ranked_results),
+                "relevance_counts": relevance_counts,
+                "evidence": [
+                    {"evidence_id": item.get("evidence_id"), **item.get("evidence_classification", {})}
+                    for item in insufficient_context.get("context", [])
+                ],
+                "reason": (
+                    "Retrieved passages contain explicit opposing claims."
+                    if relevance_counts["contradictory"] > 0
+                    else "No retrieved passage directly addresses the requested information type."
+                ),
+            }
+            has_related_evidence = any(
+                relevance_counts[key] for key in (
+                    "direct", "supporting_contextual", "related_indirect", "complication", "contradictory",
+                )
+            )
+            has_conflict = relevance_counts["contradictory"] > 0
+            final_decision = (
+                "conflicting_evidence" if has_conflict else
+                "insufficient_evidence" if has_related_evidence else
+                "no_relevant_evidence"
+            )
+            if has_conflict:
+                refusal = "Retrieved passages contain conflicting information relevant to this question. The disagreement is unresolved, so a reliable answer has been withheld."
+            elif not has_related_evidence:
+                refusal = "No retrieved passages meaningfully addressed the requested biomedical subject or information type."
+            return {
+                "query": query,
+                "retrieval": {
+                    "fused_count": len(retrieval_result.get("fused_results", [])) + external_count,
+                    "reranked_count": len(ranked_results), "grounded": False,
+                },
+                "compression": {
+                    "compressed_count": len(insufficient_context.get("context", [])),
+                    "sources": insufficient_context.get("sources", []),
+                    "evidence": insufficient_context.get("context", []),
+                    "formatted": insufficient_context.get("formatted_text", ""),
+                },
+                "generation": {
+                    "answer": refusal,
+                    "model": getattr(self.generator, "model_name", self.generator_config.get("model_name", "unknown")),
+                    "success": True,
+                },
+                "validation": {
+                    "valid": False,
+                    "issues": [
+                        "Retrieved evidence contains conflicting information."
+                        if has_conflict else
+                        "Retrieved evidence does not directly establish the requested information."
+                    ],
+                    "claim_support": [],
+                },
+                "timings": {"retrieval_time_ms": retrieval_time_ms, "generation_time_ms": 0.0},
+                "final_answer": refusal,
+                "answer_abstained": True,
+                "decision": final_decision,
+                "rejection_reason": (
+                    "conflicting_evidence" if has_conflict else
+                    "evidence_too_weak" if has_related_evidence else
+                    "no_relevant_evidence"
+                ),
+                "risk_tier": medical_risk.tier,
+                "question_category": medical_risk.category,
+                "evidence_confidence": "low",
+                "audit_trace": {
+                    "draft_status": "withheld_by_relevance_gate",
+                    "question_classification": evidence_audit["question_classification"],
+                    "evidence_audit": evidence_audit,
+                    "final_answer_status": final_decision,
+                    "final_decision_reason": evidence_audit["reason"],
+                },
+            }
+
+        classified_relevance = any(
+            item.get("evidence_classification", {}).get("category") in {
+                "direct", "supporting_contextual", "related_indirect", "complication", "contradictory",
+            }
+            for item in ranked_results
+        )
+        if not ranked_results or (
+            not classified_relevance
+            and not has_topic_overlap(search_query, [item.get("content", "") for item in ranked_results])
         ):
             refusal = "The available sources did not contain enough relevant evidence to answer this question reliably. Refine the question or add a source that directly covers the topic."
             evidence_reason = "evidence_too_weak" if ranked_results else "no_relevant_evidence"
@@ -479,7 +608,6 @@ class GroundedGenerationPipeline:
             and set(issues).issubset(informational_issues)
             and validation_result.get("citation_references_validated") is True
             and citation_support == 1.0
-            and diagnostics.get("lexical_support") == 1.0
             and diagnostics.get("unsupported_number_count", 0) == 0
             and has_relevant_evidence
         )
@@ -530,6 +658,14 @@ class GroundedGenerationPipeline:
             generation_result = {**generation_result, "answer": safe_answer}
             validation_result = {**validation_result, "answer": safe_answer}
 
+        final_answer = generation_result["answer"]
+        if decision == "informational":
+            final_answer += (
+                "\n\nValidation note: The cited evidence is relevant, but this answer "
+                "did not meet all validation requirements. Review the cited passages "
+                "for research use; this is not clinical validation."
+            )
+
         return {
             "query": query,
             "retrieval": {
@@ -553,7 +689,7 @@ class GroundedGenerationPipeline:
                 "retrieval_time_ms": retrieval_time_ms,
                 "generation_time_ms": generation_time_ms,
             },
-            "final_answer": generation_result["answer"],
+            "final_answer": final_answer,
             "answer_abstained": answer_abstained,
             "decision": decision,
             "rejection_reason": rejection_reason,
@@ -574,5 +710,43 @@ class GroundedGenerationPipeline:
                     "accepted" if not answer_abstained else "withheld_by_validation"
                 ),
                 "validation_issues": list(validation_result.get("issues", [])),
+                "question_classification": {
+                    "category": medical_risk.category,
+                    "risk_tier": medical_risk.tier,
+                    "subject_terms": list(query_intent.subject_terms),
+                    "information_type": query_intent.information_type,
+                    "expected_evidence": list(query_intent.expected_evidence),
+                },
+                "retrieval_configuration": {
+                    "mode": retrieval_mode,
+                    "top_k": k,
+                    "retrieval_k": retrieval_k,
+                    "expanded_query": retrieval_search_query,
+                },
+                "evidence_audit": {
+                    "retrieved_evidence_count": len(ranked_results),
+                    "relevance_counts": relevance_counts,
+                    "contradictory_evidence": {
+                        "detected": relevance_counts["contradictory"] > 0,
+                        "status": "screened",
+                        "method": "explicit-opposing-terms heuristic; not clinical adjudication",
+                    },
+                    "evidence_classifications": [
+                        {
+                            "evidence_id": item.get("evidence_id"),
+                            **(item.get("evidence_classification") or {}),
+                        }
+                        for item in compressed_context.get("context", [])
+                    ],
+                    "generated_claims": list(validation_result.get("claim_support", [])),
+                    "citation_coverage": (diagnostics or {}).get("citation_coverage"),
+                    "claim_support_status": validation_result.get("claim_support_validated", "NOT ESTABLISHED"),
+                },
+                "final_answer_status": decision,
+                "final_decision_reason": rejection_reason or (
+                    "answer passed configured checks" if decision == "answer_approved"
+                    else "relevant evidence supports an informational answer with validation limitations"
+                    if decision == "informational" else decision
+                ),
             },
         }

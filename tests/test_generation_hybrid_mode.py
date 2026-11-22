@@ -76,7 +76,11 @@ class CitationRecoveryCompressor:
     def compress(self, results):
         item = results[0]
         return {
-            "context": [{"content": item["content"], "metadata": item["metadata"]}],
+            "context": [{
+                "content": item["content"], "metadata": item["metadata"],
+                **({"evidence_classification": item["evidence_classification"]}
+                   if item.get("evidence_classification") else {}),
+            }],
             "evidence_count": 1,
             "sources": [item["metadata"]["source"]],
             "formatted_text": "[Evidence 1] known evidence",
@@ -237,3 +241,62 @@ def test_valid_initial_answer_does_not_retry(monkeypatch):
     assert len(generator.prompts) == 1
     assert result["validation"]["valid"] is True
     assert result["final_answer"] == "The evidence provides guidance [Evidence 1]."
+
+
+def test_low_risk_lexical_screen_failure_returns_informational_with_audit(monkeypatch):
+    pipeline, _ = make_citation_recovery_pipeline(
+        monkeypatch,
+        [
+            "Diabetes involves elevated blood glucose [Evidence 1].",
+            "Diabetes involves elevated blood glucose [Evidence 1].",
+        ],
+    )
+    pipeline.documents[0].content = "Diabetes refers to a condition involving high blood glucose."
+
+    class LexicalReviewValidator:
+        def validate(self, *args, **kwargs):
+            return {
+                "valid": False,
+                "issues": ["One or more sentences failed the lexical claim-support screen"],
+                "citation_references_validated": True,
+                "claim_support_validated": "NOT ESTABLISHED",
+                "claim_support": [{"claim": "Diabetes involves elevated blood glucose", "support_status": "not_established"}],
+                "diagnostics": {
+                    "citation_support_coverage": 1.0,
+                    "citation_coverage": 1.0,
+                    "lexical_support": 0.5,
+                    "unsupported_number_count": 0,
+                },
+            }
+
+    pipeline.validator = LexicalReviewValidator()
+    result = pipeline.generate("What is diabetes?")
+
+    assert result["decision"] == "informational"
+    assert result["answer_abstained"] is False
+    assert "[Evidence 1]" in result["final_answer"]
+    assert "did not meet all validation requirements" in result["final_answer"]
+    audit = result["audit_trace"]
+    assert audit["question_classification"]["risk_tier"] == "R0"
+    assert audit["evidence_audit"]["retrieved_evidence_count"] == 1
+    assert audit["evidence_audit"]["generated_claims"]
+    assert audit["evidence_audit"]["contradictory_evidence"]["status"] == "screened"
+    assert audit["final_answer_status"] == "informational"
+
+
+def test_direct_symptom_evidence_survives_question_wording_expansion(monkeypatch):
+    pipeline, _ = make_citation_recovery_pipeline(
+        monkeypatch,
+        [
+            "Common symptoms of diabetes include increased thirst and frequent urination [Evidence 1].",
+        ],
+    )
+    pipeline.documents[0].content = (
+        "Common symptoms of diabetes include increased thirst and frequent urination."
+    )
+    result = pipeline.generate("What are common symptoms of diabetes?")
+
+    assert result["decision"] == "answer_approved"
+    assert result["answer_abstained"] is False
+    assert "increased thirst" in result["final_answer"]
+    assert result["compression"]["evidence"][0]["evidence_classification"]["category"] == "direct"

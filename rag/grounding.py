@@ -21,6 +21,9 @@ _GENERIC_QUERY_TERMS = frozenset({
     "this", "when", "where", "with", "your",
     "guide", "guidance", "evidence", "answer", "question", "query", "test", "say",
     "says", "based", "available", "include", "including", "information", "using",
+    "common", "sign", "signs", "manifestation", "manifestations", "etiology",
+    "reason", "reasons", "risk", "factor", "factors", "define", "definition",
+    "meaning", "mechanism", "process", "function", "regulate", "regulated",
 })
 def _topic_terms(text: str) -> set[str]:
     terms = set()

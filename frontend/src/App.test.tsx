@@ -143,6 +143,48 @@ describe("research dashboard", () => {
     expect(screen.getAllByText("The indexed evidence describes it as a movement disorder.")).not.toHaveLength(0);
   });
 
+  it("restores evidence relevance labels and their actual category counts", async () => {
+    const restoredState = stateResponse();
+    restoredState.events = [{
+      id: "query-indirect",
+      event: "query",
+      timestamp: "2026-10-20T00:00:00Z",
+      success: false,
+      query: "What are common symptoms of diabetes?",
+      answer: "Related biomedical sources were retrieved, but none directly addresses the requested symptoms information.",
+      decision: "insufficient_evidence",
+      answer_abstained: true,
+      source_count: 2,
+      rejection_reason: "evidence_too_weak",
+      audit_trace: {
+        evidence_audit: {
+          reason: "No retrieved passage directly addresses the requested information type.",
+          relevance_counts: { direct: 0, supporting_contextual: 0, related_indirect: 1, complication: 1, contradictory: 0, irrelevant: 0, uncertain: 0 },
+        },
+      },
+      retrieved_evidence: [
+        { evidence_id: "evidence-1", source: "MedlinePlus", text: "Prediabetes", evidence_classification: { category: "related_indirect" } },
+        { evidence_id: "evidence-2", source: "MedlinePlus", text: "Diabetic eye problems", evidence_classification: { category: "complication" } },
+      ],
+    }];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const body = url.endsWith("/api/sessions")
+        ? { session_id: "session-test", created_at: "2026-10-20T00:00:00Z" }
+        : restoredState;
+      return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByText("Evidence relevance: Related, but not sufficiently direct")).toBeInTheDocument();
+    expect(screen.getByText("Direct: 0")).toBeInTheDocument();
+    expect(screen.getByText("Related / indirect: 1")).toBeInTheDocument();
+    expect(screen.getByText("Complication: 1")).toBeInTheDocument();
+    expect(screen.getByText("related indirect")).toBeInTheDocument();
+    expect(screen.getByText("complication")).toBeInTheDocument();
+  });
+
   it("recovers from a stale session when starting a new chat", async () => {
     const freshState = { ...stateResponse(), session_id: "fresh-session" };
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {

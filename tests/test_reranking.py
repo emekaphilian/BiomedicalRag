@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rag.document import BiomedicalDocument
 import rag.reranking_retriever as reranking_module
+import rag.reranker as reranker_module
 
 
 def test_reranking_preserves_metadata_for_source_documents_and_chunks(
@@ -128,6 +129,25 @@ def test_reranking_skips_results_without_metadata(monkeypatch):
         (document.content, document.metadata, 0.04),
     ]
     assert response["reranked_results"] == retriever.reranker.candidates
+
+
+def test_cross_encoder_receives_title_and_section_context(monkeypatch):
+    class FakeCrossEncoder:
+        def __init__(self, model_name):
+            self.pairs = None
+
+        def predict(self, pairs):
+            self.pairs = pairs
+            return [0.75]
+
+    monkeypatch.setattr(reranker_module, "CrossEncoder", FakeCrossEncoder)
+    reranker = reranker_module.CrossEncoderReranker("test-model")
+    reranker.rerank(
+        "What are common symptoms of diabetes?",
+        [("The passage discusses increased thirst.", {"title": "Diabetes symptoms", "section": "Signs"}, 0.02)],
+    )
+    assert "Title: Diabetes symptoms" in reranker.model.pairs[0][1]
+    assert "Section: Signs" in reranker.model.pairs[0][1]
 
 
 def run_dataset_demo():

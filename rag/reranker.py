@@ -47,10 +47,17 @@ class CrossEncoderReranker:
             return []
 
         # Prepare query-document pairs for cross-encoder
-        query_doc_pairs = [
-            [query, candidate[0][:512]]  # Truncate to 512 chars for efficiency
-            for candidate in candidates
-        ]
+        query_doc_pairs = []
+        for candidate in candidates:
+            metadata = candidate[1] if len(candidate) > 1 and isinstance(candidate[1], dict) else {}
+            title = metadata.get("title") or metadata.get("document_title") or ""
+            section = metadata.get("section") or metadata.get("heading") or ""
+            passage = candidate[0]
+            contextual_text = (
+                f"Title: {title}\nSection: {section}\nPassage: {passage}"
+                if title or section else passage
+            )
+            query_doc_pairs.append([query, contextual_text[:512]])
 
         # Score all pairs using cross-encoder
         scores = self.model.predict(query_doc_pairs)

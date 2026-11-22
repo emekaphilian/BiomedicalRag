@@ -155,9 +155,10 @@ class PostGenerationValidator:
                     "claim_id": f"claim-{claim_index}",
                     "claim": row["sentence"],
                     "support_status": (
-                        "lexical_candidate"
-                        if row.get("supported") and row.get("citation_supported")
-                        else "not_established"
+                        "supported" if row.get("supported") and row.get("citation_supported")
+                        else "partially_supported" if row.get("supported") or row.get("citation_supported")
+                        else "uncertain" if row.get("source_index") or row.get("valid_citations")
+                        else "unsupported"
                     ),
                     "evidence_ids": [record.get("evidence_id", f"evidence-{evidence_index}")]
                     if evidence_index and isinstance(record, dict) else [],
@@ -168,6 +169,7 @@ class PostGenerationValidator:
                         else "missing_or_invalid"
                     ),
                     "lexical_support": row.get("support"),
+                    "unsupported_numbers": row.get("unsupported_numbers", []),
                     "method": "lexical_overlap_screen_not_entailment",
                 })
 

@@ -238,7 +238,7 @@ class BiomedicalRAGPipeline:
                 else "answer_approved" if validation.get("valid")
                 else "insufficient_evidence"
             )
-        if decision in {"safety_override", "out_of_scope", "validation_review_required"}:
+        if decision in {"safety_override", "out_of_scope", "validation_review_required", "conflicting_evidence"}:
             answer = result.get("final_answer") or result.get("generation", {}).get("answer") or "This question needs urgent medical attention."
         elif decision == "no_relevant_evidence":
             answer = result.get("final_answer") or "No sufficiently relevant passages were found in the available knowledge base."
@@ -279,6 +279,7 @@ class BiomedicalRAGPipeline:
                     "text": item.get("source_text") or item.get("content", ""),
                     "prompt_excerpt": item.get("prompt_excerpt", item.get("content", "")),
                     "rerank_score": item.get("rerank_score", 0.0),
+                    "evidence_classification": item.get("evidence_classification"),
                 }
             )
         timings = result.get("timings", {})

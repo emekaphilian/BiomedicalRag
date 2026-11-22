@@ -64,6 +64,8 @@ class ContextCompressor:
                 "source_text": result.get("content", ""),
                 "rerank_score": result.get("rerank_score", 0)
             }
+            if result.get("evidence_classification"):
+                evidence_item["evidence_classification"] = result["evidence_classification"]
             if metadata:
                 evidence_item["metadata"] = metadata
 
@@ -89,6 +91,12 @@ class ContextCompressor:
             formatted += f"[Evidence {item['id']}]\n"
             formatted += f"Source: {item['source']}\n"
             formatted += f"Relevance Score: {item['rerank_score']:.4f}\n"
+            classification = item.get("evidence_classification") or {}
+            if classification:
+                formatted += (
+                    f"Evidence relationship: {classification.get('category', 'uncertain')}\n"
+                    f"Classification note: {classification.get('reason', '')}\n"
+                )
             formatted += f"Content: {item['content']}\n"
             formatted += "\n" + "-" * 60 + "\n\n"
         

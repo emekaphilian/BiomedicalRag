@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from rag.bm25_retriever import BM25Retriever
 from rag.document import BiomedicalDocument, RetrievedChunk
 from rag.grounding import has_topic_overlap
@@ -136,3 +138,136 @@ def test_generation_suppresses_a_provider_answer_about_another_topic(monkeypatch
     assert result["answer_abstained"] is True
     assert result["compression"]["compressed_count"] == 0
     assert "not contain enough relevant evidence" in result["final_answer"]
+
+
+def test_diabetes_symptom_query_with_only_indirect_passages_withholds_answer(monkeypatch):
+    documents = [
+        BiomedicalDocument(
+            "Prediabetes occurs when blood glucose is higher than normal.",
+            {"source": "MedlinePlus", "title": "Prediabetes"},
+        ),
+        BiomedicalDocument(
+            "Diabetes-related eye problems include diabetic retinopathy and vision loss.",
+            {"source": "MedlinePlus", "title": "Diabetic eye problems"},
+        ),
+        BiomedicalDocument(
+            "Retinal disorders can lead to impaired vision.",
+            {"source": "MedlinePlus", "title": "Retinal disorders"},
+        ),
+    ]
+
+    class FakeHybridRetriever:
+        def __init__(self, vectorstore, received_documents):
+            assert received_documents == documents
+            self.dense_retriever = SimpleNamespace(vectorstore=vectorstore)
+
+        def retrieve(self, query, k):
+            assert "manifestation" in query
+            return {"fused_results": [(doc.content, 1.0) for doc in documents], "grounded": True}
+
+    def unexpected_generation(*args, **kwargs):
+        raise AssertionError("Generation must not run without direct symptom evidence")
+
+    monkeypatch.setattr(generation_module, "HybridRetriever", FakeHybridRetriever)
+    monkeypatch.setattr(generation_module, "retrieve_pubmed", lambda *args, **kwargs: [])
+    monkeypatch.setattr(generation_module.GroundedGenerator, "generate", unexpected_generation)
+    pipeline = generation_module.GroundedGenerationPipeline(
+        object(), documents, use_mock=False, use_reranking=False,
+    )
+
+    result = pipeline.generate("What are common symptoms of diabetes?")
+
+    assert result["decision"] == "insufficient_evidence"
+    assert result["answer_abstained"] is True
+    assert result["compression"]["compressed_count"] == 3
+    classifications = [item["evidence_classification"]["category"] for item in result["compression"]["evidence"]]
+    assert "related_indirect" in classifications
+    assert "complication" in classifications
+    assert result["audit_trace"]["evidence_audit"]["relevance_counts"]["direct"] == 0
+    assert "do not establish the central answer" in result["final_answer"]
+
+
+def test_mixed_diabetes_retrieval_promotes_direct_passages_before_top_k(monkeypatch):
+    documents = [
+        BiomedicalDocument(
+            "Prediabetes occurs when blood glucose is higher than normal.",
+            {"source": "MedlinePlus", "title": "Prediabetes"},
+        ),
+        BiomedicalDocument(
+            "Diabetes-related eye complications include diabetic retinopathy and vision loss.",
+            {"source": "MedlinePlus", "title": "Diabetic eye complications"},
+        ),
+        BiomedicalDocument(
+            "Common symptoms of diabetes include increased thirst and frequent urination.",
+            {"source": "MedlinePlus", "title": "Diabetes symptoms"},
+        ),
+        BiomedicalDocument(
+            "Symptoms of diabetes can include unexplained weight loss.",
+            {"source": "MedlinePlus", "title": "Diabetes symptoms overview"},
+        ),
+    ]
+
+    class FakeHybridRetriever:
+        def __init__(self, vectorstore, received_documents):
+            self.dense_retriever = SimpleNamespace(vectorstore=vectorstore)
+
+        def retrieve(self, query, k):
+            return {"fused_results": [(doc.content, 1.0 - index * 0.01) for index, doc in enumerate(documents)], "grounded": True}
+
+    monkeypatch.setattr(generation_module, "HybridRetriever", FakeHybridRetriever)
+    monkeypatch.setattr(generation_module, "retrieve_pubmed", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        generation_module.GroundedGenerator,
+        "generate",
+        lambda *args, **kwargs: {
+            "answer": "Common symptoms of diabetes include increased thirst and frequent urination [Evidence 1].",
+            "success": True,
+            "model": "controlled-test",
+        },
+    )
+    pipeline = generation_module.GroundedGenerationPipeline(
+        object(), documents, use_mock=False, use_reranking=False,
+    )
+
+    result = pipeline.generate("What are common symptoms of diabetes?", k=2, retrieval_k=4)
+
+    assert result["decision"] in {"answer_approved", "informational"}
+    assert len(result["compression"]["evidence"]) == 2
+    assert all(item["evidence_classification"]["category"] == "direct" for item in result["compression"]["evidence"])
+    assert "weight loss" not in result["final_answer"].lower()
+
+
+def test_incomplete_direct_passage_only_supports_the_reported_symptoms(monkeypatch):
+    document = BiomedicalDocument(
+        "Diabetes symptoms can include increased thirst and frequent urination.",
+        {"source": "MedlinePlus", "title": "Diabetes symptoms"},
+    )
+
+    class FakeHybridRetriever:
+        def __init__(self, vectorstore, documents):
+            self.dense_retriever = SimpleNamespace(vectorstore=vectorstore)
+
+        def retrieve(self, query, k):
+            return {"fused_results": [(document.content, 1.0)], "grounded": True}
+
+    monkeypatch.setattr(generation_module, "HybridRetriever", FakeHybridRetriever)
+    monkeypatch.setattr(generation_module, "retrieve_pubmed", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        generation_module.GroundedGenerator,
+        "generate",
+        lambda *args, **kwargs: {
+            "answer": "The passage identifies increased thirst and frequent urination as possible diabetes symptoms [Evidence 1].",
+            "success": True,
+            "model": "controlled-test",
+        },
+    )
+    pipeline = generation_module.GroundedGenerationPipeline(
+        object(), [document], use_mock=False, use_reranking=False,
+    )
+
+    result = pipeline.generate("What are common symptoms of diabetes?")
+
+    assert result["decision"] in {"answer_approved", "informational"}
+    assert "increased thirst" in result["final_answer"].lower()
+    assert "frequent urination" in result["final_answer"].lower()
+    assert "weight loss" not in result["final_answer"].lower()
