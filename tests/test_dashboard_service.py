@@ -139,7 +139,11 @@ def test_dashboard_service_exposes_pipeline_governance_details(monkeypatch):
 
     _, _, details = service.query_with_details("What does the guide say?")
 
-    assert details == {
+    assert {key: details[key] for key in (
+        "is_grounded", "retrieval_grounded", "generation_success",
+        "answer_abstained", "validation_passed", "warnings",
+        "retrieval_time_ms", "generation_time_ms",
+    )} == {
         "is_grounded": True,
         "retrieval_grounded": True,
         "generation_success": True,
@@ -186,6 +190,7 @@ def test_dashboard_service_retrieves_sparse_evidence_without_generation(
 
     monkeypatch.setattr(services, "BiomedicalRAGPipeline", FakePipeline)
     monkeypatch.setattr(bm25_retriever, "BM25Retriever", FakeBM25Retriever)
+    monkeypatch.setattr("rag.medical_risk.is_medical_query", lambda question: True)
     service = services.RAGService("cohere", "command-r-plus", "test-key")
     service.ingest(b"Diabetes information from a clinical guide.", "guide.txt")
 
@@ -255,6 +260,7 @@ def test_dashboard_service_retrieves_hybrid_evidence_with_chunk_provenance(
 
     monkeypatch.setattr(services, "BiomedicalRAGPipeline", FakePipeline)
     monkeypatch.setattr(hybrid_retriever, "HybridRetriever", FakeHybridRetriever)
+    monkeypatch.setattr("rag.medical_risk.is_medical_query", lambda question: True)
     service = services.RAGService("cohere", "command-r-plus", "test-key")
     service.ingest(b"Diabetes information from a clinical guide.", "guide.txt")
 

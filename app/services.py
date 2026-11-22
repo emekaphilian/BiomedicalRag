@@ -298,6 +298,15 @@ class RAGService:
                 getattr(response, "generation_success", True)
             ),
             "answer_abstained": bool(getattr(response, "answer_abstained", False)),
+            "decision": str(getattr(response, "decision", "answer_approved")),
+            "rejection_reason": getattr(response, "rejection_reason", None),
+            "validation_diagnostics": getattr(response, "validation_diagnostics", None),
+            "audit_trace": getattr(response, "audit_trace", None),
+            "risk_tier": str(getattr(response, "risk_tier", "R0")),
+            "question_category": str(getattr(response, "question_category", "general_biomedical_education")),
+            "claim_support": getattr(response, "claim_support", []),
+            "evidence_confidence": getattr(response, "evidence_confidence", None),
+            "confidence_basis": getattr(response, "confidence_basis", None),
             "validation_passed": bool(
                 getattr(response, "validation_passed", not getattr(response, "warnings", []))
             ),
@@ -596,6 +605,10 @@ class RAGService:
             raise ValueError("top_k must be at least 1.")
         if not isinstance(question, str) or not question.strip():
             raise ValueError("The query must be a non-empty string.")
+        from rag.medical_risk import is_medical_query
+
+        if not is_medical_query(question):
+            raise ValueError("BioMed RAG retrieves medical and biomedical evidence only.")
         if self.pipeline.vectorstore is None:
             raise RuntimeError("Index documents before running retrieval.")
 

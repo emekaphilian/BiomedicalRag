@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from rag.document import BiomedicalDocument
 import rag.generation_pipeline as generation_module
 
@@ -5,6 +7,7 @@ import rag.generation_pipeline as generation_module
 class FakeHybridRetriever:
     def __init__(self, vectorstore, documents):
         self.documents = documents
+        self.dense_retriever = SimpleNamespace(vectorstore=vectorstore)
 
     def retrieve(self, query, k):
         return {
@@ -49,13 +52,14 @@ class FakeGenerator:
 
 
 class FakeValidator:
-    def validate(self, answer, evidence_count):
+    def validate(self, answer, evidence_count, evidence_texts=None, evidence_records=None):
         return {"valid": True, "issues": []}
 
 
 class CitationRecoveryRetriever:
     def __init__(self, vectorstore, documents):
         self.documents = documents
+        self.dense_retriever = SimpleNamespace(vectorstore=vectorstore)
 
     def retrieve(self, query, k):
         document = self.documents[0]
@@ -102,6 +106,8 @@ class ScriptedGenerator:
 
 
 def make_citation_recovery_pipeline(monkeypatch, answers):
+    monkeypatch.setattr(generation_module, "is_medical_query", lambda query: True)
+    monkeypatch.setattr(generation_module, "has_topic_overlap", lambda query, passages: True)
     monkeypatch.setattr(
         generation_module, "HybridRetriever", CitationRecoveryRetriever
     )
@@ -131,6 +137,8 @@ def make_citation_recovery_pipeline(monkeypatch, answers):
 
 
 def test_hybrid_mode_preserves_metadata_and_skips_unmapped_fused_results(monkeypatch):
+    monkeypatch.setattr(generation_module, "is_medical_query", lambda query: True)
+    monkeypatch.setattr(generation_module, "has_topic_overlap", lambda query, passages: True)
     monkeypatch.setattr(generation_module, "HybridRetriever", FakeHybridRetriever)
     monkeypatch.setattr(generation_module, "ContextCompressor", FakeCompressor)
     monkeypatch.setattr(
@@ -190,7 +198,7 @@ def test_missing_citations_remain_fail_closed_when_retry_also_fails(monkeypatch)
 
     assert len(generator.prompts) == 2
     assert result["generation"]["answer"] == result["final_answer"]
-    assert "reliable answer" in result["final_answer"]
+    assert "could not be validated" in result["final_answer"]
     assert "The evidence still provides guidance" not in result["final_answer"]
     assert result["validation"]["valid"] is False
     assert "No evidence citations found in answer" in result["validation"]["issues"]
@@ -203,6 +211,8 @@ def test_internal_reasoning_is_replaced_with_safe_refusal(monkeypatch):
     pipeline, _ = make_citation_recovery_pipeline(
         monkeypatch,
         ["We need to answer the query: Parkinson's disease affects dopamine. "
+         "Answer: It affects dopamine-producing neurons [Evidence 1].",
+         "We need to answer the query: Parkinson's disease affects dopamine. "
          "Answer: It affects dopamine-producing neurons [Evidence 1]."],
     )
     pipeline.documents[0].content = "Parkinson's disease affects dopamine."

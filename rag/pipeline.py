@@ -1,6 +1,6 @@
 """End-to-end biomedical retrieval and grounded-answer pipeline."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import RLock
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -23,6 +23,15 @@ class RAGResponse:
     validation_passed: bool = False
     answer_abstained: bool = False
     validation_states: Dict[str, Any] | None = None
+    decision: str = "answer_approved"
+    rejection_reason: str | None = None
+    validation_diagnostics: Dict[str, Any] | None = None
+    audit_trace: Dict[str, Any] | None = None
+    risk_tier: str = "R0"
+    question_category: str = "general_biomedical_education"
+    claim_support: List[Dict[str, Any]] = field(default_factory=list)
+    evidence_confidence: str | None = None
+    confidence_basis: str | None = None
 
 
 def _build_index(documents):
@@ -109,10 +118,6 @@ class BiomedicalRAGPipeline:
         self, question, top_k, use_reranking, retrieval_mode,
         chat_history, retrieval_query, source_screen,
     ) -> RAGResponse:
-        if self.vectorstore is None:
-            raise RuntimeError(
-                "The RAG pipeline has no index. Call index_documents first."
-            )
         if not isinstance(question, str) or not question.strip():
             raise ValueError("The query must be a non-empty string.")
         if top_k < 1:
@@ -121,7 +126,48 @@ class BiomedicalRAGPipeline:
             raise ValueError("retrieval_mode must be hybrid, dense, or sparse.")
 
         from rag.disclaimer import append_disclaimer
+        from rag.medical_risk import classify_medical_risk, is_medical_followup, is_medical_query
         from rag.safety import process_safe_query
+
+        medical_risk = classify_medical_risk(question)
+        medical_scope = is_medical_query(question) or is_medical_followup(question, chat_history)
+        if not medical_scope and medical_risk.tier not in {"R3", "R4"}:
+            return RAGResponse(
+                answer="BioMed RAG answers medical and biomedical questions only. Ask about a health condition, symptom, treatment evidence, anatomy, or biology topic.",
+                sources=[], confidence=None, is_grounded=False,
+                warnings=["The question is outside the medical and biomedical scope."],
+                retrieval_time_ms=0.0, generation_time_ms=0.0,
+                generation_success=False, validation_passed=False,
+                answer_abstained=True, decision="out_of_scope",
+                rejection_reason="non_medical_question", risk_tier=medical_risk.tier,
+                question_category=medical_risk.category,
+            )
+        if medical_risk.tier in {"R2", "R3", "R4"}:
+            emergency = medical_risk.tier == "R4"
+            individualized = medical_risk.tier == "R2"
+            response = (
+                "If this may be a medical emergency, contact your local emergency "
+                "service now. I can’t assess an individual emergency in chat."
+                if emergency else
+                "This may need urgent medical attention. Contact a qualified "
+                "health professional or urgent care service now, especially if "
+                "symptoms are severe or worsening."
+            )
+            if individualized:
+                response = (
+                    "I can share general medical information, but I can’t diagnose you "
+                    "or recommend an individual treatment decision. Please discuss "
+                    "your situation with a qualified healthcare professional."
+                )
+            return RAGResponse(
+                answer=append_disclaimer(response), sources=[], confidence=None,
+                is_grounded=False, warnings=["High-risk query safety override."],
+                retrieval_time_ms=0.0, generation_time_ms=0.0,
+                generation_success=False, validation_passed=False,
+                answer_abstained=True, decision="safety_override",
+                rejection_reason=f"medical_{medical_risk.label}_override",
+                risk_tier=medical_risk.tier, question_category=medical_risk.category,
+            )
 
         safety_result = process_safe_query(question)
         if not safety_result.allowed:
@@ -136,6 +182,11 @@ class BiomedicalRAGPipeline:
                 retrieval_grounded=False,
                 generation_success=False,
                 validation_passed=False,
+                answer_abstained=True,
+                decision="safety_override",
+                rejection_reason="query_safety_blocked",
+                risk_tier=medical_risk.tier,
+                question_category=medical_risk.category,
             )
 
         generation_config = self.config.get("generator", {})
@@ -179,7 +230,27 @@ class BiomedicalRAGPipeline:
             generation.get("success", validation.get("valid", False))
         )
 
-        if generation_reported and not generation_success:
+        explicit_decision = result.get("decision")
+        decision = explicit_decision
+        if decision is None:
+            decision = (
+                "generation_failed" if generation_reported and not generation_success
+                else "answer_approved" if validation.get("valid")
+                else "insufficient_evidence"
+            )
+        if decision in {"safety_override", "out_of_scope", "validation_review_required"}:
+            answer = result.get("final_answer") or result.get("generation", {}).get("answer") or "This question needs urgent medical attention."
+        elif decision == "no_relevant_evidence":
+            answer = result.get("final_answer") or "No sufficiently relevant passages were found in the available knowledge base."
+        elif decision == "generation_failed":
+            answer = result.get("final_answer") or "Answer generation failed. Review any retrieved sources or retry the question."
+        elif decision == "insufficient_evidence":
+            answer = (
+                result.get("final_answer")
+                if explicit_decision == "insufficient_evidence"
+                else "I could not find enough supporting evidence to answer confidently."
+            )
+        elif generation_reported and not generation_success:
             failure_detail = generation.get("error") or generation.get("answer")
             if not failure_detail:
                 failure_detail = (
@@ -188,14 +259,12 @@ class BiomedicalRAGPipeline:
             answer = str(failure_detail)
             if not answer.lower().startswith("generation failed:"):
                 answer = f"Generation failed: {answer}"
-        elif validation.get("valid"):
+        elif decision in {"answer_approved", "informational"}:
             answer = result["final_answer"]
         else:
-            answer = (
-                "I could not produce an answer that passed the evidence and "
-                "safety checks."
-            )
-        answer = append_disclaimer(answer)
+            answer = "I could not find enough supporting evidence to answer confidently."
+        if decision != "out_of_scope":
+            answer = append_disclaimer(answer)
 
         evidence = result["compression"].get("evidence", [])
         sources = []
@@ -206,7 +275,9 @@ class BiomedicalRAGPipeline:
             sources.append(
                 {
                     **metadata,
-                    "text": item.get("content", ""),
+                    "evidence_id": item.get("evidence_id", f"evidence-{item.get('id', len(sources) + 1)}"),
+                    "text": item.get("source_text") or item.get("content", ""),
+                    "prompt_excerpt": item.get("prompt_excerpt", item.get("content", "")),
                     "rerank_score": item.get("rerank_score", 0.0),
                 }
             )
@@ -228,6 +299,22 @@ class BiomedicalRAGPipeline:
             generation_success=generation_success,
             validation_passed=bool(validation.get("valid")),
             answer_abstained=bool(result.get("answer_abstained", False)),
+            decision=decision,
+            rejection_reason=result.get("rejection_reason"),
+            validation_diagnostics=validation.get("diagnostics"),
+            audit_trace=result.get("audit_trace"),
+            risk_tier=result.get("risk_tier", medical_risk.tier),
+            question_category=medical_risk.category,
+            claim_support=validation.get("claim_support", []),
+            evidence_confidence=(
+                "strong" if decision == "answer_approved"
+                else "moderate" if decision == "informational"
+                else "limited" if decision == "validation_review_required"
+                else "low"
+            ),
+            confidence_basis=(
+                "Heuristic summary of retrieval relevance, citation references, and lexical checks; not a calibrated probability or clinical accuracy assessment."
+            ),
             validation_states={
                 "RETRIEVAL_RELEVANCE_VALIDATED": bool(result["retrieval"].get("grounded")),
                 "CITATION_REFERENCES_VALIDATED": bool(validation.get("citation_references_validated", False)),

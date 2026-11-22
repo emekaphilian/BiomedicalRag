@@ -454,6 +454,21 @@ credentials should be placed in this repository.
 
 ## Configuration
 
+Playground questions and evidence retrieval are restricted to medical and
+biomedical topics. When indexed evidence is absent or fails the retrieval
+relevance threshold, the API can query PubMed through NCBI E-utilities for a
+small number of matching abstracts. External articles are shown with their
+PubMed links and labeled as research sources that BioMed RAG has not
+independently verified. Set `BIOMED_RAG_EXTERNAL_SOURCES=false` on the API
+server to disable this fallback; `NCBI_EMAIL` may be set for the NCBI request
+contact field.
+
+Responses distinguish verified answers, informational answers, validation
+review required, insufficient evidence, and medical safety overrides. A
+validation review means relevant evidence was retrieved but the generated draft
+was withheld because it did not pass configured checks. Confidence percentages
+are not displayed because this pipeline does not produce calibrated confidence.
+
 The React + FastAPI application is the canonical deployment path. Provider defaults
 and request controls are defined in `app/api.py`; the active `RAGService` pipeline
 settings are defined in `app/services.py` and `rag/pipeline.py`. The legacy

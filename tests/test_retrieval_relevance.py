@@ -135,4 +135,4 @@ def test_generation_suppresses_a_provider_answer_about_another_topic(monkeypatch
 
     assert result["answer_abstained"] is True
     assert result["compression"]["compressed_count"] == 0
-    assert "could not produce an answer" in result["final_answer"]
+    assert "not contain enough relevant evidence" in result["final_answer"]

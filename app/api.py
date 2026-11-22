@@ -625,6 +625,7 @@ def create_session(request: Request):
             created_at=created_at,
             owner_id=request.state.principal_id,
         )
+    _persist_sessions()
     return SessionResponse(session_id=session_id, created_at=created_at)
 
 
@@ -634,15 +635,75 @@ def get_session_state(session_id: str, request: Request):
     return _session_state(session_id, session)
 
 
+@app.post("/api/sessions/{session_id}/new-chat", response_model=SessionResponse)
+def create_chat_session(session_id: str, request: Request):
+    """Start an empty conversation with the current session's model and corpus."""
+    current = _session(session_id, request.state.principal_id)
+    new_id = str(uuid4())
+    created_at = _now()
+    service = current.service
+    if service is None:
+        api_key = os.getenv(f"{current.provider.upper()}_API_KEY", "")
+        if api_key:
+            try:
+                service = _new_service(current.provider, current.model, api_key)
+            except Exception as error:
+                logger.exception("Could not restore model connection for a new chat")
+                service = None
+        # Session metadata survives process restarts, but provider clients and
+        # in-memory vector indexes do not. Starting a fresh conversation must
+        # still succeed; the user can reconnect from the model settings.
+    new_session = DashboardSession(
+        created_at=created_at,
+        owner_id=current.owner_id,
+        provider=current.provider,
+        model=current.model,
+        retrieval_mode=current.retrieval_mode,
+        top_k=current.top_k,
+        service=service,
+        documents=[dict(document) for document in current.documents],
+    )
+    with _sessions_lock:
+        _sessions[new_id] = new_session
+    _persist_sessions()
+    return SessionResponse(session_id=new_id, created_at=created_at)
+
+
 def _session_state(session_id: str, session: DashboardSession) -> dict[str, Any]:
     events = [event for event in session.events if event.get("event") == "query"]
-    successful = [event for event in events if event.get("success")]
-    latencies = [
-        event["latency_ms"]
-        for event in successful
-        if isinstance(event.get("latency_ms"), (int, float))
+    approved = [
+        event for event in events
+        if event.get("decision") == "answer_approved"
+        or ("decision" not in event and event.get("success") and not event.get("answer_abstained"))
     ]
+    informational = [event for event in events if event.get("decision") == "informational"]
+    validation_review = [event for event in events if event.get("decision") == "validation_review_required"]
+    out_of_scope = [event for event in events if event.get("decision") == "out_of_scope"]
+    answered = approved + informational
+    abstained = [
+        event for event in events
+        if event.get("answer_abstained")
+        and event.get("decision") != "validation_review_required"
+        and (
+            event.get("generation_success") is not False
+            or event.get("rejection_reason") in {
+                "query_safety_blocked", "source_prompt_injection_blocked",
+            }
+            or str(event.get("rejection_reason", "")).startswith("medical_")
+        )
+    ]
+    failed = [event for event in events if event not in answered and event not in abstained and event not in validation_review and event not in out_of_scope]
+    latencies = sorted(
+        event["latency_ms"] for event in events
+        if isinstance(event.get("latency_ms"), (int, float))
+    )
     latency_mean = sum(latencies) / len(latencies) if latencies else 0.0
+    middle = len(latencies) // 2
+    median_latency = (
+        (latencies[middle - 1] + latencies[middle]) / 2
+        if len(latencies) and len(latencies) % 2 == 0
+        else latencies[middle] if latencies else None
+    )
     return {
         "session_id": session_id,
         "created_at": session.created_at,
@@ -658,10 +719,21 @@ def _session_state(session_id: str, session: DashboardSession) -> dict[str, Any]
         "fairness_reports": session.fairness_reports,
         "risk_register": session.risk_register,
         "summary": {
-            "successful_queries": len(successful),
-            "failed_queries": len(events) - len(successful),
-            "grounded_queries": sum(event.get("is_grounded") is True for event in successful),
+            "successful_queries": len(answered),
+            "approved_queries": len(approved),
+            "informational_queries": len(informational),
+            "validation_review_queries": len(validation_review),
+            "out_of_scope_queries": len(out_of_scope),
+            "failed_queries": len(failed),
+            "abstained_queries": len(abstained),
+            "total_queries": len(events),
+            "answer_rate": len(answered) / len(events) if events else None,
+            "approval_rate": len(approved) / len(events) if events else None,
+            "warning_rate": len(informational) / len(events) if events else None,
+            "abstention_rate": len(abstained) / len(events) if events else None,
+            "grounded_queries": sum(event.get("is_grounded") is True for event in answered),
             "mean_latency_ms": latency_mean,
+            "median_latency_ms": median_latency,
             "answer_audits": summarize_audits(
                 [event["audit"] for event in session.events if event.get("audit")]
             ),
@@ -706,6 +778,7 @@ def configure_session(session_id: str, request: ConfigureRequest, http_request: 
         "model": model,
         "configuration": _configuration(session),
     })
+    _persist_sessions()
     return _session_state(session_id, session)
 
 
@@ -757,6 +830,7 @@ async def upload_document(
         "sha256": digest,
         "latency_ms": (time.perf_counter() - started) * 1000,
     })
+    _persist_sessions()
     return {"document": record, "chunk_count": chunks}
 
 
@@ -789,6 +863,7 @@ def query(request: QueryRequest, http_request: Request):
     if guard.blocked:
         event["error"] = "This query was blocked by the heuristic prompt-attack screen."
         session.events.append(event)
+        _persist_sessions()
         raise HTTPException(status_code=400, detail=event["error"])
     try:
         # Compatibility for host adapters that do not expose the canonical RAG
@@ -801,6 +876,7 @@ def query(request: QueryRequest, http_request: Request):
                 event["security"]["source_attack_indices"] = blocked_sources
                 event["error"] = "Potential prompt-injection content was found in retrieved evidence; generation was blocked."
                 session.events.append(event)
+                _persist_sessions()
                 raise HTTPException(status_code=400, detail=event["error"])
         stream, sources, details = service.query_with_details(
             question=guard.sanitized,
@@ -816,10 +892,15 @@ def query(request: QueryRequest, http_request: Request):
             mode=request.retrieval_mode,
         )
         raw_answer = "".join(stream)
+        if details.get("audit_trace"):
+            details["audit_trace"] = _redact_payload(details["audit_trace"])
         pii_count = len(find_pii(raw_answer))
         answer = redact_pii(raw_answer)[0]
         safe_sources = _redact_payload(sources)
-        source_texts = [str(source.get("text", "")) for source in safe_sources]
+        source_texts = [
+            str(source.get("prompt_excerpt") or source.get("text", ""))
+            for source in safe_sources
+        ]
         generation_success = bool(details.get("generation_success", True))
         answer_abstained = bool(details.get("answer_abstained", False))
         answer_audit = (
@@ -833,24 +914,41 @@ def query(request: QueryRequest, http_request: Request):
         event["error"] = str(error)
         event["latency_ms"] = (time.perf_counter() - started) * 1000
         session.events.append(event)
+        _persist_sessions()
         raise HTTPException(status_code=422, detail=str(error)) from error
     except Exception as error:
         logger.exception("Biomedical query failed")
         event["error"] = "The RAG query failed. Check API logs for details."
         event["latency_ms"] = (time.perf_counter() - started) * 1000
         session.events.append(event)
+        _persist_sessions()
         raise HTTPException(status_code=502, detail=event["error"]) from error
 
     latency_ms = (time.perf_counter() - started) * 1000
     event.update({
-        "success": generation_success,
+        "success": generation_success and not answer_abstained,
         "answer": answer,
         "sources": [_redact_payload(source.get("source", "Unknown")) for source in safe_sources],
+        "retrieved_evidence": safe_sources,
         "source_count": len(safe_sources),
         "is_grounded": details.get("is_grounded"),
         "retrieval_grounded": details.get("retrieval_grounded"),
         "generation_success": details.get("generation_success"),
         "answer_abstained": details.get("answer_abstained", False),
+        "decision": details.get("decision") or (
+            "generation_failed" if not generation_success
+            else "insufficient_evidence" if answer_abstained
+            else "answer_approved"
+        ),
+        "rejection_reason": details.get("rejection_reason"),
+        "validation_diagnostics": details.get("validation_diagnostics"),
+        "validation_states": details.get("validation_states"),
+        "risk_tier": details.get("risk_tier", "R0"),
+        "question_category": details.get("question_category", "general_biomedical_education"),
+        "claim_support": details.get("claim_support", []),
+        "evidence_confidence": details.get("evidence_confidence"),
+        "confidence_basis": details.get("confidence_basis"),
+        "audit_trace": _redact_payload(details.get("audit_trace")),
         "validation_passed": details.get("validation_passed"),
         "warnings": details.get("warnings", []),
         "latency_ms": latency_ms,
@@ -865,6 +963,7 @@ def query(request: QueryRequest, http_request: Request):
     if not generation_success:
         event["error"] = "Generation failed. See the returned answer and warnings for provider details."
     session.events.append(event)
+    _persist_sessions()
     return {
         "event_id": event_id,
         "answer": answer,
@@ -928,6 +1027,7 @@ def evaluate_retrieval(request: RetrievalEvaluationRequest, session_id: str, htt
     }
     session.evaluation_runs.append(run)
     session.events.append({"event": "retrieval_evaluation", **run})
+    _persist_sessions()
     return run
 
 
@@ -948,6 +1048,7 @@ def evaluate_answer(request: AnswerEvaluationRequest, session_id: str, http_requ
         "audit": report,
         "configuration": _configuration(session),
     })
+    _persist_sessions()
     return report
 
 
@@ -959,12 +1060,12 @@ def create_review(request: ReviewRequest, session_id: str, http_request: Request
             event for event in session.events
             if event.get("id") == request.query_event_id
             and event.get("event") == "query"
-            and event.get("success")
+            and (event.get("success") or event.get("answer_abstained"))
         ),
         None,
     )
     if query_event is None:
-        raise HTTPException(status_code=404, detail="Successful query event not found.")
+        raise HTTPException(status_code=404, detail="Reviewable query event not found.")
     from dashboard.audit_utils import QUALITY_DIMENSIONS
 
     unknown_dimensions = set(request.ratings) - set(QUALITY_DIMENSIONS)
@@ -985,6 +1086,7 @@ def create_review(request: ReviewRequest, session_id: str, http_request: Request
     }
     session.answer_quality_reviews.append(review)
     session.events.append({"event": "answer_review", **review, "success": True})
+    _persist_sessions()
     return review
 
 
@@ -1057,6 +1159,7 @@ def run_fairness_screen(request: FairnessRequest, http_request: Request):
         "limits": "Lexical comparison is a screening signal for qualified human review, not proof of bias or fairness.",
     }
     session.fairness_reports.append(report_record)
+    _persist_sessions()
     return report_record
 
 
@@ -1074,6 +1177,7 @@ def record_operator_risk(request: OperatorRiskRequest, session_id: str, http_req
         **score,
     }
     session.risk_register.append(record)
+    _persist_sessions()
     return record
 
 
@@ -1090,6 +1194,7 @@ def add_governance_finding(request: FindingRequest, session_id: str, http_reques
         },
     }
     session.risk_register.append(finding)
+    _persist_sessions()
     return finding
 
 

@@ -84,6 +84,32 @@ def test_health_and_session_state_are_available(client):
     assert "api_key" not in str(state)
 
 
+def test_new_chat_starts_clean_session_and_preserves_live_configuration(client):
+    old_session_id = configured_session(client)
+    api._sessions[old_session_id].events.append({"event": "query", "query": "What is diabetes?"})
+
+    response = client.post(f"/api/sessions/{old_session_id}/new-chat", json={})
+
+    assert response.status_code == 200
+    new_session_id = response.json()["session_id"]
+    assert new_session_id != old_session_id
+    state = client.get(f"/api/sessions/{new_session_id}").json()
+    assert state["configured"] is True
+    assert state["events"] == []
+    assert state["configuration"]["settings"]["model"] == "command-test"
+
+
+def test_new_chat_succeeds_after_session_restore_without_live_service(client):
+    session_id = client.post("/api/sessions", json={}).json()["session_id"]
+    api._sessions[session_id].provider = "unsupported-provider"
+
+    response = client.post(f"/api/sessions/{session_id}/new-chat", json={})
+
+    assert response.status_code == 200
+    state = client.get(f"/api/sessions/{response.json()['session_id']}").json()
+    assert state["configured"] is False
+
+
 def test_api_authentication_is_required_except_for_health(client):
     anonymous = TestClient(api.app)
     assert anonymous.get("/api/health").status_code == 200

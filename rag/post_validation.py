@@ -27,7 +27,6 @@ class PostGenerationValidator:
             "i recommend",
             "start this medication",
             "stop this treatment",
-            "you have",  # diagnosis
             "this will cure",
             "guaranteed to",
             "will definitely",
@@ -41,7 +40,13 @@ class PostGenerationValidator:
             "not enough information",
         ]
 
-    def validate(self, generation_result, evidence_count, evidence_texts=None):
+    def validate(
+        self,
+        generation_result,
+        evidence_count,
+        evidence_texts=None,
+        evidence_records=None,
+    ):
         """
         Validate generated answer.
         
@@ -76,6 +81,19 @@ class PostGenerationValidator:
             if phrase in answer:
                 issues.append(f"Forbidden phrase detected: '{phrase}'")
 
+        # Generic educational wording such as "If you have diabetes" is common
+        # in source passages and is not a diagnosis. Still reject direct claims
+        # that diagnose the user, while allowing conditional source phrasing.
+        for match in re.finditer(r"\byou have\b", answer):
+            clause_start = max(
+                answer.rfind(mark, 0, match.start())
+                for mark in (".", "!", "?", ";", ":", ",")
+            )
+            clause_prefix = answer[clause_start + 1:match.start()].strip()
+            if not re.match(r"if\b", clause_prefix):
+                issues.append("Forbidden phrase detected: direct diagnosis ('you have')")
+                break
+
         # Check citation identifiers against the exact evidence shown to the model.
         citations = [int(value) for value in re.findall(
             r"\[Evidence\s+(\d+)\]", generation_result["answer"], re.IGNORECASE
@@ -109,6 +127,7 @@ class PostGenerationValidator:
         support_audit = audit_answer(
             generation_result["answer"], evidence_texts or [],
         ) if evidence_texts else None
+        claim_support = []
         if support_audit and support_audit["sentence_count"]:
             if support_audit["invalid_citations"]:
                 issues.append("Evidence citation references do not match the supplied evidence")
@@ -116,6 +135,41 @@ class PostGenerationValidator:
                 issues.append("One or more factual sentences lack a citation linked to overlapping evidence")
             if support_audit["faithfulness"] < 1.0:
                 issues.append("One or more sentences failed the lexical claim-support screen")
+            records = evidence_records or []
+            for claim_index, row in enumerate(support_audit["sentences"], 1):
+                evidence_index = row.get("source_index")
+                record = (
+                    records[evidence_index - 1]
+                    if evidence_index and evidence_index <= len(records)
+                    else {}
+                )
+                metadata = record.get("metadata", {}) if isinstance(record, dict) else {}
+                source_id = (
+                    metadata.get("document_id")
+                    or metadata.get("source_id")
+                    or metadata.get("source")
+                    or record.get("source")
+                    if isinstance(record, dict) else None
+                )
+                claim_support.append({
+                    "claim_id": f"claim-{claim_index}",
+                    "claim": row["sentence"],
+                    "support_status": (
+                        "lexical_candidate"
+                        if row.get("supported") and row.get("citation_supported")
+                        else "not_established"
+                    ),
+                    "evidence_ids": [record.get("evidence_id", f"evidence-{evidence_index}")]
+                    if evidence_index and isinstance(record, dict) else [],
+                    "source_ids": [str(source_id)] if source_id is not None else [],
+                    "citation_status": (
+                        "valid_and_linked" if row.get("citation_supported")
+                        else "valid_reference_not_linked" if row.get("valid_citations")
+                        else "missing_or_invalid"
+                    ),
+                    "lexical_support": row.get("support"),
+                    "method": "lexical_overlap_screen_not_entailment",
+                })
 
         valid = len(issues) == 0
 
@@ -132,5 +186,18 @@ class PostGenerationValidator:
             ),
             "claim_support_validated": "NOT ESTABLISHED",
             "claim_support_method": "lexical-overlap-screen" if support_audit else "not-evaluated",
+            "diagnostics": ({
+                "factual_sentence_count": support_audit["sentence_count"],
+                "citation_coverage": support_audit["attribution_coverage"],
+                "citation_support_coverage": support_audit["citation_support_coverage"],
+                "lexical_support": support_audit["faithfulness"],
+                "unsupported_number_count": sum(
+                    len(row.get("unsupported_numbers", []))
+                    for row in support_audit["flagged_sentences"]
+                ),
+                "method": "lexical-overlap-screen",
+                "thresholds": support_audit["thresholds"],
+            } if support_audit else None),
+            "claim_support": claim_support,
             "evidence_used": evidence_count
         }

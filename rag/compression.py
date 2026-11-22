@@ -55,8 +55,13 @@ class ContextCompressor:
             # Structured evidence format
             evidence_item = {
                 "id": idx,
+                "evidence_id": f"evidence-{idx}",
                 "source": source,
                 "content": content,
+                "prompt_excerpt": content,
+                # Keep the complete retrieved chunk for provenance and display.
+                # `content` remains the bounded version sent to the model prompt.
+                "source_text": result.get("content", ""),
                 "rerank_score": result.get("rerank_score", 0)
             }
             if metadata:

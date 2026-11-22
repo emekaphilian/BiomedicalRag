@@ -57,6 +57,10 @@ export interface AuditEvent {
   event: string;
   timestamp: string;
   success?: boolean;
+  decision?: string;
+  rejection_reason?: string;
+  answer_abstained?: boolean;
+  generation_success?: boolean;
   query?: string;
   answer?: string;
   sources?: string[];
@@ -84,8 +88,19 @@ export interface DashboardState {
   summary: {
     successful_queries: number;
     failed_queries: number;
+    abstained_queries?: number;
+    total_queries?: number;
+    answer_rate?: number | null;
+    approved_queries?: number;
+    informational_queries?: number;
+    validation_review_queries?: number;
+    out_of_scope_queries?: number;
+    approval_rate?: number | null;
+    warning_rate?: number | null;
+    abstention_rate?: number | null;
     grounded_queries: number;
     mean_latency_ms: number;
+    median_latency_ms?: number | null;
     answer_audits: Record<string, number | null>;
     retrieval_metrics: Record<string, number | null>;
     answer_quality_reviews: Record<string, number | null>;

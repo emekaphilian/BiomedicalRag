@@ -71,8 +71,8 @@ describe("research dashboard", () => {
 
   it("creates a session and displays dashboard metrics", async () => {
     render(<App />);
-    expect(await screen.findByText("System overview")).toBeInTheDocument();
-    expect(screen.getByText("Successful queries")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "What would you like to research?" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /New chat/i })).toBeInTheDocument();
     expect(window.localStorage.getItem("biomed-rag-session")).toBe("session-test");
   });
 
@@ -91,7 +91,7 @@ describe("research dashboard", () => {
     }));
 
     render(<App />);
-    await screen.findByText("System overview");
+    await screen.findByRole("heading", { name: "What would you like to research?" });
 
     expect(requestHeaders.length).toBeGreaterThan(0);
     expect(requestHeaders[0].get("Authorization")).toBe("Bearer researcher-test-token");
@@ -101,14 +101,14 @@ describe("research dashboard", () => {
     setApiToken("");
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "System overview" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "What would you like to research?" })).toBeInTheDocument();
     expect(screen.queryByLabelText("Bearer token")).not.toBeInTheDocument();
     expect(getApiToken()).toBe("");
   });
 
   it("navigates between the research and governance surfaces", async () => {
     render(<App />);
-    await screen.findByText("System overview");
+    await screen.findByRole("heading", { name: "What would you like to research?" });
     fireEvent.click(screen.getByRole("button", { name: "Governance" }));
     await waitFor(() => expect(screen.getByRole("heading", { name: "Safety & governance" })).toBeInTheDocument());
     expect(screen.getByRole("heading", { name: "Fairness comparison" })).toBeInTheDocument();
@@ -137,11 +137,33 @@ describe("research dashboard", () => {
     }));
 
     render(<App />);
-    await screen.findByText("System overview");
-    fireEvent.click(screen.getByRole("button", { name: "Playground" }));
+    await screen.findByRole("button", { name: "Playground" });
 
-    expect(await screen.findByText("What is Parkinson's disease?")).toBeInTheDocument();
-    expect(screen.getByText("The indexed evidence describes it as a movement disorder.")).toBeInTheDocument();
+    expect(await screen.findAllByText("What is Parkinson's disease?")).not.toHaveLength(0);
+    expect(screen.getAllByText("The indexed evidence describes it as a movement disorder.")).not.toHaveLength(0);
+  });
+
+  it("recovers from a stale session when starting a new chat", async () => {
+    const freshState = { ...stateResponse(), session_id: "fresh-session" };
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/sessions")) {
+        return new Response(JSON.stringify({ session_id: "fresh-session", created_at: "2026-10-20T00:00:00Z" }), { status: 200 });
+      }
+      if (url.includes("/new-chat")) {
+        return new Response(JSON.stringify({ detail: "Dashboard session not found." }), { status: 404 });
+      }
+      return new Response(JSON.stringify(freshState), { status: 200 });
+    }));
+
+    window.localStorage.setItem("biomed-rag-session", "session-test");
+    render(<App />);
+    await screen.findByRole("heading", { name: "What would you like to research?" });
+    fireEvent.click(screen.getByRole("button", { name: "Playground" }));
+    fireEvent.click(screen.getByRole("button", { name: /New chat/i }));
+
+    await waitFor(() => expect(window.localStorage.getItem("biomed-rag-session")).toBe("fresh-session"));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("shows the API error rather than hiding a failed request", async () => {

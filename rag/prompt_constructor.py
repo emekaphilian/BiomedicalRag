@@ -27,11 +27,13 @@ CRITICAL REQUIREMENTS:
 5. If you cannot find direct evidence, refuse to answer
 
 OUTPUT FORMAT:
-Answer: [Your answer with inline citations such as [Evidence 1]]
-Sources: [List the evidence item labels used, such as [Evidence 1], [Evidence 2]]
+Write a concise answer in plain language with inline citations. Do not add a separate
+Sources section; citations in the answer are the source references.
 
 DO NOT provide medical diagnoses, treatment plans, or medical advice.
-Keep answers factual and evidence-grounded."""
+Keep answers factual and evidence-grounded. Return only the final answer. Never
+include private reasoning, analysis, planning, control tokens, or commentary about
+following these instructions."""
 
     def construct(self, query, compressed_context, chat_history=None):
         """

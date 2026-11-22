@@ -112,15 +112,11 @@ def test_pipeline_indexes_and_queries_with_mock_generation(monkeypatch):
     assert BiomedicialRAGPipeline is BiomedicalRAGPipeline
 
 
-def test_pipeline_rejects_queries_before_indexing():
+def test_pipeline_without_index_returns_no_relevant_evidence():
     pipeline = BiomedicalRAGPipeline({})
-
-    try:
-        pipeline.query("What is diabetes?")
-    except RuntimeError as exc:
-        assert "Call index_documents first" in str(exc)
-    else:
-        raise AssertionError("Querying before indexing should fail.")
+    response = pipeline.query("What is diabetes?")
+    assert response.decision == "no_relevant_evidence"
+    assert response.answer_abstained is True
 
 
 def test_pipeline_blocks_personalized_medical_advice(monkeypatch):
@@ -166,11 +162,11 @@ def test_pipeline_does_not_return_generation_that_failed_validation(monkeypatch)
         fake_build_generation_pipeline,
     )
 
-    response = pipeline.query("What does the evidence say?")
+    response = pipeline.query("What does the diabetes evidence say?")
 
     assert not response.is_grounded
     assert response.warnings == ["Forbidden phrase detected"]
-    assert "could not produce an answer" in response.answer.lower()
+    assert "could not find enough supporting evidence" in response.answer.lower()
     assert "You should take" not in response.answer
 
 

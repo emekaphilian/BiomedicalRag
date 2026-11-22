@@ -40,16 +40,23 @@ class QueryClassifier:
         r"could\s+i\s+have\b",
         r"am\s+i\s+(?:at\s+risk|susceptible|vulnerable)\b",
         r"do\s+(?:i|my)\s+(?:have\s+)?symptoms\b",
+        r"what\s+(?:do|does)\s+(?:these|my)\s+symptoms\s+(?:mean|suggest)\b",
+        r"what\s+is\s+my\s+diagnosis\b",
     ]
 
     # Patterns indicating treatment/medical advice requests
     TREATMENT_PATTERNS = [
         r"how\s+(?:do\s+)?i\s+(?:treat|cure|fix|manage|control)",
+        r"how\s+can\s+i\s+(?:treat|manage|control|cure)",
+        r"what\s+should\s+i\s+do\b",
         r"(?:what\s+)?(?:is\s+)?(?:the\s+)?best\s+(?:treatment|cure|medicine|drug)",
         r"should\s+i\s+(?:take|use|try|do)\b",
         r"can\s+(?:i|this|that)\s+(?:cure|treat|fix)\b",
         r"(?:prescription|medication|medicine|drug)\s+(?:for|to)",
         r"(?:what\s+)?(?:medicine|pill|drug|medication)\s+should\b",
+        r"(?:can|should)\s+i\s+(?:take|stop|start|change|increase|decrease|skip|combine)\b",
+        r"\bhow\s+much\b.{0,50}\b(?:medicine|medication|drug|dose|dosage|insulin)\b",
+        r"\b(?:dose|dosage)\b.{0,40}\b(?:my|me|child|baby|patient)\b",
     ]
 
     # Patterns indicating ambiguous/unclear questions
