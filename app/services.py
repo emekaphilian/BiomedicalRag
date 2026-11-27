@@ -35,12 +35,6 @@ BASE_CORPUS_DIR = (
     / "processed"
     / "downloaded_sources"
 )
-_FOLLOW_UP_REFERENCE = re.compile(
-    r"\b(?:it|its|they|them|their|this|that|these|those|what about|how about|how so)\b",
-    re.IGNORECASE,
-)
-
-
 @dataclass(frozen=True)
 class RepairOutcome:
     """Public, non-sensitive result of an application-side repair request."""
@@ -256,6 +250,7 @@ class RAGService:
         chat_history: Optional[list] = None,
         top_k: int = 5,
         mode: str = "hybrid",
+        answer_mode: str = "research",
         source_screen=None,
     ) -> Tuple[Iterator[str], list, dict]:
         """Return answer chunks, provenance, and checked pipeline details."""
@@ -280,11 +275,14 @@ class RAGService:
             for parameter in query_parameters
         ):
             query_options["source_screen"] = source_screen
+        if any(
+            parameter.name == "answer_mode"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in query_parameters
+        ):
+            query_options["answer_mode"] = answer_mode
         if chat_history:
             query_options["chat_history"] = chat_history[-6:]
-            previous_query = str(chat_history[-1].get("query", "")).strip()
-            if previous_query and _FOLLOW_UP_REFERENCE.search(question):
-                query_options["retrieval_query"] = f"{previous_query} {question}"
         response = self.pipeline.query(question, **query_options)
         sources = [dict(source) for source in response.sources]
         chunks = re.findall(r"\S+\s*", response.answer)
@@ -307,6 +305,7 @@ class RAGService:
             "claim_support": getattr(response, "claim_support", []),
             "evidence_confidence": getattr(response, "evidence_confidence", None),
             "confidence_basis": getattr(response, "confidence_basis", None),
+            "learning_answer": getattr(response, "learning_answer", None),
             "validation_passed": bool(
                 getattr(response, "validation_passed", not getattr(response, "warnings", []))
             ),

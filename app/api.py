@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import inspect
 import ipaddress
 import json
 import logging
@@ -82,6 +83,8 @@ class QueryRequest(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
     top_k: int = Field(default=5, ge=1, le=15)
     retrieval_mode: str = "hybrid"
+    answer_mode: str = "research"
+    supersedes_event_id: str | None = Field(default=None, max_length=100)
 
 
 class RetrieveRequest(BaseModel):
@@ -840,6 +843,8 @@ def query(request: QueryRequest, http_request: Request):
     service = _require_service(session, generation=True)
     if request.retrieval_mode not in {"hybrid", "dense", "sparse"}:
         raise HTTPException(status_code=422, detail="Unsupported retrieval mode.")
+    if request.answer_mode not in {"research", "learning", "compare"}:
+        raise HTTPException(status_code=422, detail="Unsupported answer mode.")
     session.retrieval_mode = request.retrieval_mode
     session.top_k = request.top_k
     guard = guard_question(request.question)
@@ -878,19 +883,24 @@ def query(request: QueryRequest, http_request: Request):
                 session.events.append(event)
                 _persist_sessions()
                 raise HTTPException(status_code=400, detail=event["error"])
-        stream, sources, details = service.query_with_details(
-            question=guard.sanitized,
-            chat_history=[
+        query_options = {
+            "question": guard.sanitized,
+            "chat_history": [
                 {"query": event["query"], "answer": event["answer"]}
                 for event in session.events
                 if event.get("event") == "query"
-                and event.get("success")
                 and event.get("query")
                 and event.get("answer")
+                and event.get("decision") not in {"out_of_scope", "safety_override"}
             ][-6:],
-            top_k=request.top_k,
-            mode=request.retrieval_mode,
-        )
+            "top_k": request.top_k,
+            "mode": request.retrieval_mode,
+            "answer_mode": request.answer_mode,
+        }
+        service_parameters = inspect.signature(service.query_with_details).parameters.values()
+        if not any(parameter.name == "answer_mode" or parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in service_parameters):
+            query_options.pop("answer_mode")
+        stream, sources, details = service.query_with_details(**query_options)
         raw_answer = "".join(stream)
         if details.get("audit_trace"):
             details["audit_trace"] = _redact_payload(details["audit_trace"])
@@ -928,6 +938,7 @@ def query(request: QueryRequest, http_request: Request):
     event.update({
         "success": generation_success and not answer_abstained,
         "answer": answer,
+        "learning_answer": details.get("learning_answer"),
         "sources": [_redact_payload(source.get("source", "Unknown")) for source in safe_sources],
         "retrieved_evidence": safe_sources,
         "source_count": len(safe_sources),
@@ -957,6 +968,11 @@ def query(request: QueryRequest, http_request: Request):
         "provider": session.provider,
         "model": session.model,
         "retrieval_mode": request.retrieval_mode,
+        "answer_mode": request.answer_mode,
+        "supersedes_event_id": request.supersedes_event_id if any(
+            str(existing.get("id")) == request.supersedes_event_id
+            for existing in session.events
+        ) else None,
         "top_k": request.top_k,
         "security": {**event["security"], "pii_exposed_in_answer": pii_count},
     })

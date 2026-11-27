@@ -71,9 +71,43 @@ describe("research dashboard", () => {
 
   it("creates a session and displays dashboard metrics", async () => {
     render(<App />);
-    expect(await screen.findByRole("heading", { name: "What would you like to research?" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Research medicine. Understand the evidence." })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /New chat/i })).toBeInTheDocument();
     expect(window.localStorage.getItem("biomed-rag-session")).toBe("session-test");
+  });
+
+  it("shows the selected answer mode in the sidebar status", async () => {
+    render(<App />);
+    await screen.findByRole("heading", { name: "Research medicine. Understand the evidence." });
+    fireEvent.click(screen.getByRole("button", { name: "Compare" }));
+    expect(screen.getByText("Compare mode · Connect a model in Settings")).toBeInTheDocument();
+  });
+
+  it("shows a visible message instead of a blank answer when the API returns empty text", async () => {
+    const configuredState = { ...stateResponse(), configured: true };
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/sessions")) {
+        return new Response(JSON.stringify({ session_id: "session-test", created_at: "2026-01-01T00:00:00Z" }), { status: 200 });
+      }
+      if (url.endsWith("/api/query")) {
+        return new Response(JSON.stringify({
+          event_id: "empty-answer",
+          answer: "",
+          sources: [],
+          details: { decision: "answer_approved", answer_abstained: false, generation_success: true, learning_answer: "" },
+          latency_ms: 100,
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(JSON.stringify(configuredState), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "Research medicine. Understand the evidence." });
+    fireEvent.change(screen.getByLabelText("Ask a biomedical question"), { target: { value: "What is the function of dopamine?" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send question" }));
+
+    expect(await screen.findByText("No answer text was returned. Please retry the question.")).toBeInTheDocument();
   });
 
   it("sends the browser-session bearer token with API requests", async () => {
@@ -91,7 +125,7 @@ describe("research dashboard", () => {
     }));
 
     render(<App />);
-    await screen.findByRole("heading", { name: "What would you like to research?" });
+    await screen.findByRole("heading", { name: "Research medicine. Understand the evidence." });
 
     expect(requestHeaders.length).toBeGreaterThan(0);
     expect(requestHeaders[0].get("Authorization")).toBe("Bearer researcher-test-token");
@@ -101,18 +135,32 @@ describe("research dashboard", () => {
     setApiToken("");
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "What would you like to research?" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Research medicine. Understand the evidence." })).toBeInTheDocument();
     expect(screen.queryByLabelText("Bearer token")).not.toBeInTheDocument();
     expect(getApiToken()).toBe("");
   });
 
   it("navigates between the research and governance surfaces", async () => {
     render(<App />);
-    await screen.findByRole("heading", { name: "What would you like to research?" });
+    await screen.findByRole("heading", { name: "Research medicine. Understand the evidence." });
     fireEvent.click(screen.getByRole("button", { name: "Governance" }));
     await waitFor(() => expect(screen.getByRole("heading", { name: "Safety & governance" })).toBeInTheDocument());
     expect(screen.getByRole("heading", { name: "Fairness comparison" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Risk register" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    expect(await screen.findByRole("heading", { name: "Research medicine. Understand the evidence." })).toBeInTheDocument();
+  });
+
+  it("moves backward and forward through menu views", async () => {
+    render(<App />);
+    await screen.findByRole("heading", { name: "Research medicine. Understand the evidence." });
+    fireEvent.click(screen.getByRole("button", { name: "Research Library" }));
+    expect(await screen.findByRole("heading", { name: "Knowledge base" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(await screen.findByRole("heading", { name: "Research medicine. Understand the evidence." })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Forward" }));
+    expect(await screen.findByRole("heading", { name: "Knowledge base" })).toBeInTheDocument();
   });
 
   it("restores previous chat turns from the active session", async () => {
@@ -137,13 +185,81 @@ describe("research dashboard", () => {
     }));
 
     render(<App />);
-    await screen.findByRole("button", { name: "Playground" });
+    await screen.findByRole("heading", { name: "BioMedGPT" });
 
     expect(await screen.findAllByText("What is Parkinson's disease?")).not.toHaveLength(0);
     expect(screen.getAllByText("The indexed evidence describes it as a movement disorder.")).not.toHaveLength(0);
   });
 
-  it("restores evidence relevance labels and their actual category counts", async () => {
+  it("shows validation notes as a separate, labeled callout", async () => {
+    const restoredState = stateResponse();
+    restoredState.events = [{
+      id: "query-validation-note",
+      event: "query",
+      timestamp: "2026-10-20T00:00:00Z",
+      success: true,
+      query: "What is cancer?",
+      answer: "Cancer develops when cells grow abnormally [Evidence 1].\n\nValidation note: The cited evidence is relevant, but this answer did not meet all validation requirements. Review the cited passages for research use; this is not clinical validation.",
+      source_count: 1,
+      retrieved_evidence: [{ evidence_id: "evidence-1", citation_index: 1, source: "MedlinePlus", text: "Cancer develops when cells grow abnormally." }],
+    }];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const body = url.endsWith("/api/sessions")
+        ? { session_id: "session-test", created_at: "2026-10-20T00:00:00Z" }
+        : restoredState;
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }));
+
+    const { container } = render(<App />);
+    const note = await screen.findByRole("note");
+
+    expect(note).toHaveClass("validation-note");
+    expect(note).toHaveTextContent("Validation note");
+    expect(note).toHaveTextContent("did not meet all validation requirements");
+    expect(note.previousElementSibling).toHaveTextContent("Cancer develops when cells grow abnormally");
+    expect(container.querySelectorAll(".validation-note")).toHaveLength(1);
+    expect(screen.queryByRole("link", { name: "[Evidence 1]" })).not.toBeInTheDocument();
+  });
+
+  it("opens retrieved passages when an answer asks the user to review them", async () => {
+    const restoredState = stateResponse();
+    restoredState.events = [{
+      id: "query-insufficient-with-passage",
+      event: "query",
+      timestamp: "2026-10-20T00:00:00Z",
+      success: false,
+      query: "What is glaucoma?",
+      answer: "I found related biomedical information, but the retrieved sources do not directly answer your question. Review the passages below or refine your question.",
+      decision: "insufficient_evidence",
+      answer_abstained: true,
+      source_count: 1,
+      retrieved_evidence: [{
+        evidence_id: "evidence-1",
+        citation_index: 1,
+        source: "MedlinePlus",
+        title: "Glaucoma",
+        text: "Glaucoma is a group of eye diseases that can damage the optic nerve.",
+      }],
+    }];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const body = url.endsWith("/api/sessions")
+        ? { session_id: "session-test", created_at: "2026-10-20T00:00:00Z" }
+        : restoredState;
+      return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByText("Glaucoma is a group of eye diseases that can damage the optic nerve.")).toBeInTheDocument();
+    expect(screen.getByText("Retrieved passages (1)").closest("details")).toHaveAttribute("open");
+  });
+
+  it("keeps evidence relevance diagnostics out of chat and available in audit", async () => {
     const restoredState = stateResponse();
     restoredState.events = [{
       id: "query-indirect",
@@ -177,12 +293,47 @@ describe("research dashboard", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("Evidence relevance: Related, but not sufficiently direct")).toBeInTheDocument();
-    expect(screen.getByText("Direct: 0")).toBeInTheDocument();
-    expect(screen.getByText("Related / indirect: 1")).toBeInTheDocument();
-    expect(screen.getByText("Complication: 1")).toBeInTheDocument();
-    expect(screen.getByText("related indirect")).toBeInTheDocument();
+    expect(await screen.findAllByText("What are common symptoms of diabetes?")).not.toHaveLength(0);
+    expect(screen.queryByText("Evidence relevance: Related, but not sufficiently direct")).not.toBeInTheDocument();
+    expect(screen.queryByText("Direct: 0")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText("Workspace tools"));
+    fireEvent.click(screen.getByRole("button", { name: "Audit" }));
+    const inspect = await screen.findByText("Inspect");
+    fireEvent.click(inspect);
+    expect(await screen.findByText("related indirect")).toBeInTheDocument();
     expect(screen.getByText("complication")).toBeInTheDocument();
+  });
+
+  it("explains withheld answers without claiming retained passages are missing", async () => {
+    const restoredState = stateResponse();
+    restoredState.events = [{
+      id: "query-review-required",
+      event: "query",
+      timestamp: "2026-10-20T00:00:00Z",
+      success: false,
+      query: "What are common symptoms of diabetes?",
+      decision: "validation_review_required",
+      answer_abstained: true,
+      source_count: 1,
+      retrieved_evidence: [{
+        evidence_id: "evidence-1",
+        source: "MedlinePlus",
+        prompt_excerpt: "Information about diabetes complications.",
+        evidence_classification: { category: "related_indirect" },
+      }],
+    }];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const body = url.endsWith("/api/sessions")
+        ? { session_id: "session-test", created_at: "2026-10-20T00:00:00Z" }
+        : restoredState;
+      return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByText(/do not directly answer your question/i)).toBeInTheDocument();
+    expect(screen.queryByText(/did not retain passage text/i)).not.toBeInTheDocument();
   });
 
   it("recovers from a stale session when starting a new chat", async () => {
@@ -200,8 +351,7 @@ describe("research dashboard", () => {
 
     window.localStorage.setItem("biomed-rag-session", "session-test");
     render(<App />);
-    await screen.findByRole("heading", { name: "What would you like to research?" });
-    fireEvent.click(screen.getByRole("button", { name: "Playground" }));
+    await screen.findByRole("heading", { name: "Research medicine. Understand the evidence." });
     fireEvent.click(screen.getByRole("button", { name: /New chat/i }));
 
     await waitFor(() => expect(window.localStorage.getItem("biomed-rag-session")).toBe("fresh-session"));

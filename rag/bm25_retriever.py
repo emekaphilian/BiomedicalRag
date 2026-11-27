@@ -4,13 +4,24 @@ import unicodedata
 from rank_bm25 import BM25Okapi
 
 
-_TOKEN = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+_TOKEN = re.compile(r"[a-z0-9]+(?:['’]s)?", re.IGNORECASE)
+_QUERY_STOPWORDS = frozenset(" ".join((
+    "a an and are as at be by can do does for from how i in is it of on or the to was what when which with would",
+    "about answer describe explain function give information me meaning overview question related say show tell work works",
+    "definition mechanism process role roles summary summarize typical usual usually",
+)).split())
 
 
 def _tokenize(text):
     normalized = unicodedata.normalize("NFKD", text or "")
     unaccented = "".join(char for char in normalized if not unicodedata.combining(char))
-    return [token.lower() for token in _TOKEN.findall(unaccented)]
+    tokens = []
+    for token in _TOKEN.findall(unaccented):
+        token = token.lower()
+        if token.endswith(("'s", "’s")):
+            token = token[:-2]
+        tokens.append(token)
+    return tokens
 
 
 class BM25Retriever:
@@ -28,7 +39,12 @@ class BM25Retriever:
 
     def search(self, query, k=5):
 
-        tokenized_query = _tokenize(query)
+        tokenized_query = [
+            token for token in _tokenize(query)
+            if token not in _QUERY_STOPWORDS
+        ]
+        if not tokenized_query:
+            tokenized_query = _tokenize(query)
 
         scores = self.bm25.get_scores(tokenized_query)
 

@@ -155,7 +155,7 @@ def test_dashboard_service_exposes_pipeline_governance_details(monkeypatch):
     }
 
 
-def test_dashboard_service_resolves_follow_up_retrieval_from_chat_history(monkeypatch):
+def test_dashboard_service_passes_follow_up_context_to_pipeline(monkeypatch):
     monkeypatch.setattr(services, "BiomedicalRAGPipeline", FakePipeline)
     service = services.RAGService("cohere", "command-a-plus-05-2026", "test-key")
 
@@ -167,9 +167,11 @@ def test_dashboard_service_resolves_follow_up_retrieval_from_chat_history(monkey
         }],
     )
 
-    assert service.pipeline.retrieval_query == (
-        "What is Parkinson's disease? What about its symptoms?"
-    )
+    assert service.pipeline.chat_history == [{
+        "query": "What is Parkinson's disease?",
+        "answer": "It is a movement disorder.",
+    }]
+    assert service.pipeline.retrieval_query is None
 
 
 def test_dashboard_service_retrieves_sparse_evidence_without_generation(

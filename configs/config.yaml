@@ -29,6 +29,8 @@ generator:
   max_tokens: 256
   temperature: 0.3
   top_p: 0.9
+  semantic_support_threshold: 0.54
+  minimum_answer_coverage: 0.50
 
 safety:
   medical_disclaimer_enabled: true

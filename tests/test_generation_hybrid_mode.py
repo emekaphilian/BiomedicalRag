@@ -1,7 +1,31 @@
 from types import SimpleNamespace
 
 from rag.document import BiomedicalDocument
+from rag.post_validation import PostGenerationValidator
 import rag.generation_pipeline as generation_module
+
+
+def test_comparison_extractive_fallback_uses_supported_evidence_for_each_side():
+    query = "Compare type 1 vs type 2 diabetes."
+    evidence = [
+        {"content": "With Type 1 diabetes, the pancreas does not make insulin.", "metadata": {"title": "Type 1 Diabetes"}},
+        {"content": "With Type 2 diabetes, the body does not make or use insulin well.", "metadata": {"title": "Type 2 Diabetes"}},
+    ]
+    for item in evidence:
+        item["evidence_classification"] = generation_module.classify_evidence_set(query, [item])[0]
+
+    answer = generation_module._comparison_extractive_fallback(query, evidence)
+
+    assert answer is not None
+    assert "Type 1 diabetes" in answer and "[Evidence 1]" in answer
+    assert "Type 2 diabetes" in answer and "[Evidence 2]" in answer
+    validation = PostGenerationValidator().validate(
+        {"answer": answer, "success": True},
+        len(evidence),
+        [item["content"] for item in evidence],
+        evidence_records=evidence,
+    )
+    assert validation["valid"]
 
 
 class FakeHybridRetriever:
@@ -127,7 +151,7 @@ def make_citation_recovery_pipeline(monkeypatch, answers):
         vectorstore=object(),
         documents=[
             BiomedicalDocument(
-                content="The evidence provides guidance.",
+                content="Diabetes is a condition in which blood glucose levels are high.",
                 metadata={"source": "MedlinePlus"},
             )
         ],
@@ -166,47 +190,40 @@ def test_hybrid_mode_preserves_metadata_and_skips_unmapped_fused_results(monkeyp
     assert result["validation"]["valid"] is True
 
 
-def test_missing_citations_retry_and_return_validated_retry(monkeypatch):
+def test_uncited_draft_uses_a_cited_extractive_evidence_fallback(monkeypatch):
     pipeline, generator = make_citation_recovery_pipeline(
         monkeypatch,
         [
-            "The evidence provides guidance.",
-            "The evidence provides guidance [Evidence 1].",
+            "Diabetes involves elevated blood glucose.",
+            "Diabetes involves elevated blood glucose [Evidence 1].",
         ],
     )
 
-    result = pipeline.generate("What does the evidence say?")
+    result = pipeline.generate("What is diabetes?")
 
-    assert len(generator.prompts) == 2
-    retry_prompt, retry_kwargs = generator.prompts[1]
-    assert "CITATION RECOVERY REQUIREMENTS" in retry_prompt["system"]
-    assert "Use only the original supplied evidence" in retry_prompt["user"]
-    assert retry_kwargs == {"max_tokens": 123, "temperature": 0.2}
-    assert result["generation"]["answer"] == (
-        "The evidence provides guidance [Evidence 1]."
-    )
+    assert len(generator.prompts) == 1
+    assert "[Evidence 1]" in result["generation"]["answer"]
+    assert "blood glucose" in result["generation"]["answer"]
     assert result["validation"]["valid"] is True
     assert result["final_answer"] == result["generation"]["answer"]
 
 
-def test_missing_citations_remain_fail_closed_when_retry_also_fails(monkeypatch):
+def test_uncited_answer_fallback_uses_only_passage_text(monkeypatch):
     pipeline, generator = make_citation_recovery_pipeline(
         monkeypatch,
         [
-            "The evidence provides guidance.",
-            "The evidence still provides guidance without citations.",
+            "Diabetes involves elevated blood glucose.",
+            "Diabetes involves elevated blood glucose without citations.",
         ],
     )
 
-    result = pipeline.generate("What does the evidence say?")
+    result = pipeline.generate("What is diabetes?")
 
-    assert len(generator.prompts) == 2
+    assert len(generator.prompts) == 1
     assert result["generation"]["answer"] == result["final_answer"]
-    assert "could not be validated" in result["final_answer"]
-    assert "The evidence still provides guidance" not in result["final_answer"]
-    assert result["validation"]["valid"] is False
-    assert "No evidence citations found in answer" in result["validation"]["issues"]
-    assert result["answer_abstained"] is True
+    assert "[Evidence 1]" in result["final_answer"]
+    assert result["validation"]["valid"] is True
+    assert result["answer_abstained"] is False
     assert "VALIDATION FAILED" not in result["final_answer"]
     assert "Original:" not in result["final_answer"]
 
@@ -233,17 +250,18 @@ def test_internal_reasoning_is_replaced_with_safe_refusal(monkeypatch):
 def test_valid_initial_answer_does_not_retry(monkeypatch):
     pipeline, generator = make_citation_recovery_pipeline(
         monkeypatch,
-        ["The evidence provides guidance [Evidence 1]."],
+        ["Diabetes involves elevated blood glucose [Evidence 1]."],
     )
 
-    result = pipeline.generate("What does the evidence say?")
+    result = pipeline.generate("What is diabetes?")
 
     assert len(generator.prompts) == 1
     assert result["validation"]["valid"] is True
-    assert result["final_answer"] == "The evidence provides guidance [Evidence 1]."
+    assert "Diabetes involves elevated blood glucose" in result["final_answer"]
+    assert "[Evidence 1]" in result["final_answer"]
 
 
-def test_low_risk_lexical_screen_failure_returns_informational_with_audit(monkeypatch):
+def test_relevant_low_risk_answer_is_preserved_with_validation_warning(monkeypatch):
     pipeline, _ = make_citation_recovery_pipeline(
         monkeypatch,
         [
@@ -260,7 +278,12 @@ def test_low_risk_lexical_screen_failure_returns_informational_with_audit(monkey
                 "issues": ["One or more sentences failed the lexical claim-support screen"],
                 "citation_references_validated": True,
                 "claim_support_validated": "NOT ESTABLISHED",
-                "claim_support": [{"claim": "Diabetes involves elevated blood glucose", "support_status": "not_established"}],
+                "claim_support": [{
+                    "claim": "Diabetes involves elevated blood glucose [Evidence 1].",
+                    "support_status": "unsupported", "citations": [1],
+                    "lexical_support": 0.5, "semantic_similarity": 0.0,
+                    "unsupported_numbers": [],
+                }],
                 "diagnostics": {
                     "citation_support_coverage": 1.0,
                     "citation_coverage": 1.0,
@@ -274,14 +297,50 @@ def test_low_risk_lexical_screen_failure_returns_informational_with_audit(monkey
 
     assert result["decision"] == "informational"
     assert result["answer_abstained"] is False
-    assert "[Evidence 1]" in result["final_answer"]
-    assert "did not meet all validation requirements" in result["final_answer"]
+    assert "Diabetes involves elevated blood glucose" in result["final_answer"]
+    assert "could not be fully confirmed" in result["final_answer"]
     audit = result["audit_trace"]
     assert audit["question_classification"]["risk_tier"] == "R0"
     assert audit["evidence_audit"]["retrieved_evidence_count"] == 1
     assert audit["evidence_audit"]["generated_claims"]
     assert audit["evidence_audit"]["contradictory_evidence"]["status"] == "screened"
     assert audit["final_answer_status"] == "informational"
+
+
+def test_hypertension_alias_supports_cited_fallback_when_generator_abstains(monkeypatch):
+    pipeline, _ = make_citation_recovery_pipeline(
+        monkeypatch,
+        [
+            "I do not have enough information to answer.",
+            "I do not have enough information to answer.",
+        ],
+    )
+    pipeline.documents[0].content = (
+        "Primary high blood pressure develops over time as you get older. "
+        "Secondary high blood pressure is caused by another medical condition "
+        "or use of certain medicines."
+    )
+
+    result = pipeline.generate("What causes hypertension?")
+
+    assert result["answer_abstained"] is False
+    assert result["decision"] in {"answer_approved", "informational"}
+    assert "high blood pressure develops over time" in result["final_answer"].lower()
+    assert "[Evidence 1]" in result["final_answer"]
+
+
+def test_empty_model_answer_uses_supported_evidence_instead_of_returning_blank(monkeypatch):
+    pipeline, _ = make_citation_recovery_pipeline(monkeypatch, ["", ""])
+    pipeline.documents[0].content = (
+        "Dopamine is a neurotransmitter that helps control movement, motivation, and reward."
+    )
+
+    result = pipeline.generate("What is the function of dopamine?")
+
+    assert result["final_answer"].strip()
+    assert "dopamine" in result["final_answer"].lower()
+    assert "[Evidence 1]" in result["final_answer"]
+    assert result["answer_abstained"] is False
 
 
 def test_direct_symptom_evidence_survives_question_wording_expansion(monkeypatch):

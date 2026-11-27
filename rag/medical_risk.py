@@ -36,9 +36,14 @@ _MEDICAL_TOPIC_PATTERN = re.compile(
     r"disorder\w*|condition\w*|syndrome\w*|infection\w*|virus\w*|bacteri\w*|"
     r"symptom\w*|side effect\w*|cancer|tumou?r|diabetes|parkinson\w*|ebola|alzheimer\w*|"
     r"hypertension|anemia|anaemia|obesity|stroke|seizure\w*|migraine\w*|arthritis|"
-    r"eczema|allerg\w*|depression|anxiety|covid|influenza|flu|"
+    r"eczema|allerg\w*|depression|anxiety|covid|influenza|flu|ulcer\w*|"
+    r"gastric|peptic|stomach|digestive|intestinal|intestin\w*|colon|"
     r"heart|cardiac|blood|brain|lung|liver|kidney|skin|bone|muscle|nerve|"
     r"cell\w*|gene\w*|genetic\w*|protein\w*|hormone\w*|insulin|dopamine|"
+    r"neuron\w*|synap\w*|neurotransmit\w*|serotonin|neuro\w*|"
+    r"anatom\w*|physiolog\w*|biochem\w*|molecular|molecule\w*|enzyme\w*|"
+    r"metabol\w*|receptor\w*|signal(?:ing|ling)?|circulat\w*|respirat\w*|"
+    r"immune\w*|endocrine|skeletal|cardiovascular|nervous system|"
     r"vaccine\w*|immun\w*|patholog\w*|physiolog\w*|anatom\w*|pregnan\w*|"
     r"clinical trial\w*|biomedical|biolog\w*|pathogen\w*|"
     r"[a-z]+(?:itis|osis|emia|pathy|oma)\b)",
@@ -46,9 +51,37 @@ _MEDICAL_TOPIC_PATTERN = re.compile(
 )
 _MEDICAL_FOLLOWUP_PATTERN = re.compile(
     r"^\s*(?:and\s+)?(?:it|its|they|them|their|this|that|these|those|"
-    r"what about|how about|how so|tell me more|explain more|elaborate)\b",
+    r"what about|how about|how so|tell me more|explain more|explain further|"
+    r"elaborate|go on|continue)\b",
     re.IGNORECASE,
 )
+_EXPLAIN_FURTHER = re.compile(
+    r"^\s*(?:please\s+)?(?:explain|elaborate)(?:\s+on\s+(?:that|it))?\s+(?:further|more)\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def reformulate_contextual_query(query: str, chat_history=None) -> str:
+    """Resolve short follow-ups against the latest substantive user question."""
+    current = " ".join(str(query or "").split())
+    if not current or not chat_history:
+        return current
+    if not _MEDICAL_FOLLOWUP_PATTERN.search(current):
+        return current
+
+    previous_query = ""
+    for turn in reversed(chat_history):
+        if isinstance(turn, dict):
+            candidate = " ".join(str(turn.get("query", "")).split()).strip()
+            if candidate and is_medical_query(candidate):
+                previous_query = candidate.rstrip(".!? ")
+                break
+    if not previous_query:
+        return current
+
+    if _EXPLAIN_FURTHER.fullmatch(current):
+        return f"{previous_query} further."
+    return f"{previous_query}. Follow-up: {current}"
 
 
 def is_medical_query(query: str) -> bool:

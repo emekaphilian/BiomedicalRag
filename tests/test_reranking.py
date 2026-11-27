@@ -128,7 +128,9 @@ def test_reranking_skips_results_without_metadata(monkeypatch):
     assert retriever.reranker.candidates == [
         (document.content, document.metadata, 0.04),
     ]
-    assert response["reranked_results"] == retriever.reranker.candidates
+    assert response["reranked_results"][0]["content"] == document.content
+    assert response["reranked_results"][0]["metadata"] == document.metadata
+    assert response["reranked_results"][0]["cross_encoder_score"] == 0.04
 
 
 def test_cross_encoder_receives_title_and_section_context(monkeypatch):

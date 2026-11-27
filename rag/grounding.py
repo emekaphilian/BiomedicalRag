@@ -2,6 +2,7 @@ import re
 from typing import Iterable, List
 
 from rag.document import RetrievedChunk
+from rag.medical_entities import concept_match_score, expand_concepts
 
 
 MIN_GROUNDING_SCORE = 2.0
@@ -13,14 +14,16 @@ _FALLBACK_STOPWORDS = frozenset({
 })
 _GENERIC_QUERY_TERMS = frozenset({
     "about", "affect", "affects", "cause", "causes", "change", "changes",
+    "compare", "comparison", "versus", "difference", "differences", "type", "vs",
     "condition", "conditions", "disease", "diseases", "disorder", "disorders",
     "effect", "effects", "explain", "health", "impact", "information", "medical",
     "medicine", "problem", "problems", "provide", "related", "symptom", "symptoms",
-    "treatment", "treatments", "what", "which", "who", "work", "works", "does",
+    "treatment", "treatments", "therapy", "therapies", "therapeutic", "therapeutics", "drug", "drugs", "medication", "medications", "medicine", "medicines", "management", "manage", "intervention", "interventions", "approved", "option", "options", "symptomatic", "disease", "disease-modifying", "modifying", "pharmacological", "what", "which", "who", "work", "works", "does",
     "doesn", "have", "many", "much", "most", "often", "show", "tell", "they",
     "this", "when", "where", "with", "your",
     "guide", "guidance", "evidence", "answer", "question", "query", "test", "say",
     "says", "based", "available", "include", "including", "information", "using",
+    "summarize", "summary", "current", "understanding", "support", "supports",
     "common", "sign", "signs", "manifestation", "manifestations", "etiology",
     "reason", "reasons", "risk", "factor", "factors", "define", "definition",
     "meaning", "mechanism", "process", "function", "regulate", "regulated",
@@ -38,7 +41,18 @@ def _topic_terms(text: str) -> set[str]:
 
 def has_topic_overlap(query: str, passages: Iterable[str]) -> bool:
     """Require one or two specific query terms in evidence before generation."""
-    anchors = _topic_terms(query)
+    expanded_query = expand_concepts(query)
+    passage_list = list(passages)
+    has_incompatible_entity = False
+    for passage in passage_list:
+        entity_score, entity_type, _ = concept_match_score(query, passage)
+        if entity_score > 0 and entity_type != "related_condition":
+            return True
+        if entity_type == "related_condition":
+            has_incompatible_entity = True
+    if has_incompatible_entity:
+        return False
+    anchors = _topic_terms(expanded_query)
     if not anchors:
         # Generic questions and greetings have no reliable topic anchor. Do not
         # allow arbitrary nearest-neighbor evidence to make them answerable;
@@ -50,10 +64,10 @@ def has_topic_overlap(query: str, passages: Iterable[str]) -> bool:
         if not fallback_terms:
             return False
         evidence_terms = set().union(*(
-            set(_TOKEN.findall((passage or "").lower())) for passage in passages
+            set(_TOKEN.findall((passage or "").lower())) for passage in passage_list
         ))
         return bool(fallback_terms & evidence_terms)
-    evidence_terms = set().union(*(_topic_terms(passage) for passage in passages))
+    evidence_terms = set().union(*(_topic_terms(passage) for passage in passage_list))
     required_matches = min(2, len(anchors))
     return len(anchors & evidence_terms) >= required_matches
 

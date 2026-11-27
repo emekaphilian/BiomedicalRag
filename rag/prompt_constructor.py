@@ -11,7 +11,7 @@ class GroundedPromptConstructor:
     Key principles:
     - ONLY use provided evidence
     - Enforce citation for every claim
-    - Refuse if evidence insufficient
+    - Return supported facts and explain evidence gaps when coverage is partial
     - No fabrication allowed
     """
 
@@ -20,7 +20,7 @@ class GroundedPromptConstructor:
 
 CRITICAL REQUIREMENTS:
 1. Answer ONLY using the provided retrieved evidence
-2. If evidence is insufficient, say: "I do not have enough grounded evidence to answer this question reliably."
+2. Answer from supported facts only. If coverage is partial, give the supported portion and clearly identify what remains unanswered.
 3. Do NOT fabricate, speculate, or provide unsupported medical information
 4. Cite every factual sentence inline using the exact format [Evidence 1],
    with the number matching the evidence item's label
@@ -28,10 +28,15 @@ CRITICAL REQUIREMENTS:
    the requested information. Supporting/contextual evidence may clarify it.
    Related-indirect and complication evidence must not be presented as if they
    directly answer the question.
-6. If you cannot find direct evidence, refuse to answer
+6. Do not turn risk associations into causes, prevention advice into treatment evidence,
+   or a related condition into the requested condition. When direct evidence is missing,
+   explain what the retrieved passages cover and what they do not establish.
 
 OUTPUT FORMAT:
-Write a concise answer in plain language with inline citations. Do not add a separate
+Answer the user's question directly in 2-4 concise sentences, in plain language, with inline citations.
+For cause questions, lead with the established biological mechanism and distinguish it
+from factors that are associated with increased risk. Do not present risk factors as
+direct causes. If the evidence does not identify one cause, say so briefly. Do not add a separate
 Sources section; citations in the answer are the source references.
 
 DO NOT provide medical diagnoses, treatment plans, or medical advice.
@@ -73,10 +78,15 @@ following these instructions."""
 
 {evidence_text}
 
+Coverage assessment (a conservative evidence map, not a clinical judgment):
+{compressed_context.get("coverage_assessment", "Not calculated")}
+
 Based ONLY on the evidence provided above:
-1. Answer the query if sufficient evidence exists
+1. Lead with a direct answer in 2-4 concise sentences if sufficient evidence exists
 2. Cite every factual sentence with the exact label, for example [Evidence 1]
-3. Refuse if evidence is insufficient or contradictory
+3. If evidence is incomplete, state only supported facts and describe the missing coverage.
+   Do not invent a general answer from outside the retrieved evidence. For cause questions,
+   separate causal mechanisms from risk factors and describe risk factors only as risks.
 
 Remember: Do not generate information not in the evidence."""
 

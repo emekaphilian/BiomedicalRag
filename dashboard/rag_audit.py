@@ -40,7 +40,8 @@ def content_tokens(text: str) -> set:
 
 
 def split_sentences(text: str) -> list:
-    parts = re.split(r"(?<=[.!?])\s+|\n+", text or "")
+    # A citation may follow terminal punctuation; keep it attached to its claim.
+    parts = re.split(r"(?<=[.!?])\s+(?!\[Evidence\s+\d+\])|\n+", text or "", flags=re.IGNORECASE)
     return [part.strip() for part in parts if part and part.strip()]
 
 
